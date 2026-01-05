@@ -75,10 +75,35 @@ from fastapi import UploadFile, File
 
 @app.post("/api/upload_file")
 async def upload_file(file: UploadFile = File(...)):
-    # 使用用户系统模块的文件上传功能
+    # 基本使用：使用默认 bucket
+    file_url = file_to_url(file, folder_name="MY_FOLDER")
+    return {"url": file_url}
+
+@app.post("/api/upload_file_custom")
+async def upload_file_custom(file: UploadFile = File(...)):
+    # 指定 bucket
     file_url = file_to_url(file, folder_name="MY_FOLDER", bucket="my-bucket")
     return {"url": file_url}
+
+@app.post("/api/upload_file_advanced")
+async def upload_file_advanced(file: UploadFile = File(...)):
+    # 高级功能：自定义存储文件名和下载文件名
+    file_url = file_to_url(
+        file, 
+        folder_name="MY_FOLDER", 
+        bucket="my-bucket",
+        cos_filename="custom_stored_name.jpg",  # COS中存储的文件名
+        download_filename="original_name.jpg"     # 浏览器下载时显示的文件名
+    )
+    return {"url": file_url}
 ```
+
+**参数说明：**
+- `file`: UploadFile 对象（必需）
+- `folder_name`: 目标文件夹名称（可选，默认为空）
+- `bucket`: COS bucket 名称（可选，默认为 "flowtask-1302933783"）
+- `cos_filename`: COS中存储的文件名（可选，如果提供则使用此名称，否则使用原始文件名）
+- `download_filename`: 下载时展示的文件名（可选，设置后会添加 Content-Disposition 头）
 
 ### 获取当前用户ID（用于需要认证的 API）
 
