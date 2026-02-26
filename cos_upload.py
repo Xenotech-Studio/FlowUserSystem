@@ -1,11 +1,30 @@
 """
 腾讯云 COS 文件上传工具
-提供通用的文件上传功能，供用户系统和其他模块使用
+提供通用的文件上传功能，供用户系统和其他模块使用。
+密钥：优先从 config.TENCENT_SECRET_ID / TENCENT_SECRET_KEY 读取，否则使用下方默认（与联网搜索等腾讯云 API 共用）。
 """
 
 from qcloud_cos import CosConfig, CosS3Client
 import logging
 import sys
+
+# 默认密钥（与 COS / 联网搜索等腾讯云 API 共用；建议在 config.py 中配置 TENCENT_SECRET_ID / TENCENT_SECRET_KEY）
+_DEFAULT_SECRET_ID = "***REDACTED***"
+_DEFAULT_SECRET_KEY = "***REDACTED***"
+
+
+def get_tencent_credentials():
+    """返回 (secret_id, secret_key)，供 COS、联网搜索等腾讯云 API 共用。优先 config，否则默认值。"""
+    try:
+        import config as _config
+        sid = getattr(_config, "TENCENT_SECRET_ID", None) or ""
+        sk = getattr(_config, "TENCENT_SECRET_KEY", None) or ""
+        if sid.strip() and sk.strip():
+            return sid.strip(), sk.strip()
+    except ImportError:
+        pass
+    return _DEFAULT_SECRET_ID, _DEFAULT_SECRET_KEY
+
 
 def file_to_url(file, folder_name="", bucket="flowtask-1302933783", cos_filename=None, download_filename=None):
     """
@@ -21,9 +40,8 @@ def file_to_url(file, folder_name="", bucket="flowtask-1302933783", cos_filename
       上传后的文件 URL
     """
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    secret_id = '***REDACTED***'
-    secret_key = '***REDACTED***'
-    region = 'ap-guangzhou'
+    secret_id, secret_key = get_tencent_credentials()
+    region = "ap-guangzhou"
     scheme = 'https'
     config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key, Scheme=scheme)
     client = CosS3Client(config)
