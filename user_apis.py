@@ -115,19 +115,26 @@ def init_user_redis(app: FastAPI):
 
 # -------------------- API 路由定义 --------------------
 
-def register_user_apis(app: FastAPI, hooks: Optional[UserHooks] = None):
+def register_user_apis(
+    app: FastAPI,
+    hooks: Optional[UserHooks] = None,
+    *,
+    register_redis_init: bool = True,
+):
     """
     注册所有用户相关的 API 路由和数据库初始化
     
     参数:
       app: FastAPI 应用实例
       hooks: 可选的用户操作钩子，用于在用户创建/更新/删除时执行自定义逻辑
+      register_redis_init: 若为 False，则不再注册 init_user_redis（适用于已在别处调用过 init_user_redis 的场景）
     
     返回:
       get_current_user_id: 可用于 Depends 的依赖函数，用于获取当前用户ID
     """
-    # 初始化用户系统的 Redis 连接
-    init_user_redis(app)
+    # 初始化用户系统的 Redis 连接（可与路由注册分离，以保证路由顺序与 startup 顺序可控）
+    if register_redis_init:
+        init_user_redis(app)
     
     # 如果没有提供hooks，创建一个空的
     if hooks is None:

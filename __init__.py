@@ -5,6 +5,7 @@
 
 from .user_apis import (
     register_user_apis,
+    init_user_redis,
     get_user_id_from_token,
     check_access_token,
     create_get_current_user_id_dependency,
@@ -16,6 +17,7 @@ from .cos_upload import file_to_url
 
 __all__ = [
     "register_user_apis",
+    "init_user_redis",
     "get_user_id_from_token",
     "check_access_token",
     "create_get_current_user_id_dependency",
