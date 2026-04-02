@@ -4,6 +4,11 @@
 密钥：优先从 config.TENCENT_SECRET_ID / TENCENT_SECRET_KEY 读取，否则使用下方默认（与联网搜索等腾讯云 API 共用）。
 """
 
+from __future__ import annotations
+
+from io import BytesIO
+from typing import Optional
+
 from qcloud_cos import CosConfig, CosS3Client
 import logging
 import sys
@@ -86,5 +91,46 @@ def file_to_url(file, folder_name="", bucket="flowtask-1302933783", cos_filename
     # 使用文件的 file 属性直接获取文件流上传
     response = client.put_object(**upload_params)
     logging.info("Image uploaded to COS: %s", image_url)
+    return image_url
+
+
+def bytes_to_cos_url(
+    body: bytes,
+    *,
+    folder_name: str = "",
+    object_name: str = "file.bin",
+    bucket: str = "flowtask-1302933783",
+    content_type: Optional[str] = None,
+) -> str:
+    """
+    将内存中的字节上传到 COS，返回公网 HTTPS URL（与 file_to_url 同桶、同地域、同鉴权）。
+
+    用于服务端生成可给执行端直连下载的链接（例如技能包 zip 缓存）。
+    """
+    if not body:
+        raise ValueError("body is empty")
+    secret_id, secret_key = get_tencent_credentials()
+    region = "ap-guangzhou"
+    scheme = "https"
+    cfg = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key, Scheme=scheme)
+    client = CosS3Client(cfg)
+
+    folder = folder_name + "/" if (folder_name and not folder_name.endswith("/")) else folder_name
+    safe_name = (object_name or "file.bin").split("/")[-1]
+    key = folder + safe_name
+    image_url = cfg.uri(bucket=bucket, path=key)
+
+    upload_params: dict = {
+        "Bucket": bucket,
+        "Body": BytesIO(body),
+        "Key": key,
+        "StorageClass": "STANDARD",
+        "EnableMD5": False,
+    }
+    if content_type and str(content_type).strip():
+        upload_params["ContentType"] = str(content_type).strip()
+
+    client.put_object(**upload_params)
+    logging.info("Bytes uploaded to COS: %s", image_url)
     return image_url
 
