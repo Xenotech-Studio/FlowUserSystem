@@ -14,7 +14,7 @@ from .user_apis import (
     self_userinfo_keys_mask,
 )
 from .hooks import UserHooks
-from .cos_upload import file_to_url
+from .cos_upload import file_to_url, bytes_to_cos_url
 
 __all__ = [
     "register_user_apis",
@@ -25,6 +25,7 @@ __all__ = [
     "create_get_current_user_id_dependency",
     "UserHooks",
     "file_to_url",
+    "bytes_to_cos_url",
     "visitor_userinfo_keys",
     "self_userinfo_keys_mask",
 ]
