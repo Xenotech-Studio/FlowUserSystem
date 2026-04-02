@@ -15,10 +15,12 @@ from typing import Optional
 import json
 import uuid
 import redis
+import os
+from config_default import USER_SYSTEM_COS_BUCKET
 from .cos_upload import file_to_url
 from .hooks import UserHooks
 
-# Redis 连接配置（用户系统，db=7，与 flowdoc 共享）
+# Redis 默认连接配置（可被 init_user_redis 参数覆盖）
 REDIS_HOST = "127.0.0.1"
 REDIS_PORT = 6379
 REDIS_USER_DB = 7  # 用户系统 Redis 数据库编号
@@ -87,7 +89,7 @@ def create_get_current_user_id_dependency(app: FastAPI):
         token = authorization[7:]  # 移除 "Bearer " 前缀
         
         # 从token获取user_id
-        r_user = app.state.redis_user
+        r_user = get_user_redis(app)
         user_id = get_user_id_from_token(token, r_user)
         if not user_id:
             raise HTTPException(status_code=403, detail="Invalid access token")
@@ -98,13 +100,45 @@ def create_get_current_user_id_dependency(app: FastAPI):
 
 # -------------------- 数据库初始化 --------------------
 
-def init_user_redis(app: FastAPI):
-    """初始化用户系统的 Redis 连接（db=7）"""
+def get_user_redis(app: FastAPI) -> redis.Redis:
+    """
+    获取用户系统 Redis 客户端（供业务层复用）。
+
+    用法:
+        from user_system import get_user_redis
+        r_user = get_user_redis(app)
+        r_user.set("my:biz:key", "value")
+    """
+    r_user = getattr(app.state, "redis_user", None)
+    if r_user is None:
+        raise RuntimeError("app.state.redis_user 尚未初始化，请先调用 init_user_redis / register_user_apis")
+    return r_user
+
+
+def init_user_redis(
+    app: FastAPI,
+    *,
+    redis_host: Optional[str] = None,
+    redis_port: Optional[int] = None,
+    redis_db: Optional[int] = None,
+):
+    """
+    初始化用户系统的 Redis 连接。
+
+    优先级：
+      1) 显式参数（redis_host/redis_port/redis_db）
+      2) 环境变量（FLOWSYS_REDIS_HOST/FLOWSYS_REDIS_PORT/FLOWSYS_REDIS_DB）
+      3) 模块默认值（REDIS_HOST/REDIS_PORT/REDIS_USER_DB）
+    """
+    resolved_host = redis_host or os.getenv("FLOWSYS_REDIS_HOST", REDIS_HOST)
+    resolved_port = int(redis_port if redis_port is not None else os.getenv("FLOWSYS_REDIS_PORT", REDIS_PORT))
+    resolved_db = int(redis_db if redis_db is not None else os.getenv("FLOWSYS_REDIS_DB", REDIS_USER_DB))
+
     @app.on_event("startup")
     def _startup_user_redis():
-        # redis_user (db=7): 存储用户相关数据（用户信息、访问令牌），与 flowdoc 共享
+        # redis_user: 存储用户相关数据（用户信息、访问令牌）
         app.state.redis_user = redis.Redis(
-            host=REDIS_HOST, port=REDIS_PORT, db=REDIS_USER_DB, decode_responses=False
+            host=resolved_host, port=resolved_port, db=resolved_db, decode_responses=False
         )
     
     @app.on_event("shutdown")
@@ -120,6 +154,9 @@ def register_user_apis(
     hooks: Optional[UserHooks] = None,
     *,
     register_redis_init: bool = True,
+    redis_host: Optional[str] = None,
+    redis_port: Optional[int] = None,
+    redis_db: Optional[int] = None,
 ):
     """
     注册所有用户相关的 API 路由和数据库初始化
@@ -128,13 +165,14 @@ def register_user_apis(
       app: FastAPI 应用实例
       hooks: 可选的用户操作钩子，用于在用户创建/更新/删除时执行自定义逻辑
       register_redis_init: 若为 False，则不再注册 init_user_redis（适用于已在别处调用过 init_user_redis 的场景）
+      redis_host/redis_port/redis_db: 用户系统 Redis 覆盖配置
     
     返回:
       get_current_user_id: 可用于 Depends 的依赖函数，用于获取当前用户ID
     """
     # 初始化用户系统的 Redis 连接（可与路由注册分离，以保证路由顺序与 startup 顺序可控）
     if register_redis_init:
-        init_user_redis(app)
+        init_user_redis(app, redis_host=redis_host, redis_port=redis_port, redis_db=redis_db)
     
     # 如果没有提供hooks，创建一个空的
     if hooks is None:
@@ -213,15 +251,18 @@ def register_user_apis(
             existing_user = json.loads(existing_user_raw)
             existing_user.update(user_data)
             r_user.set(key, json.dumps(existing_user).encode('utf-8'))
-            # 调用更新钩子
             hooks.call_user_updated(user_id, existing_user, r_user)
-            return {"message": "User updated successfully", "user": existing_user}
+            payload_user = existing_user
+            msg = "User updated successfully"
         else:
-            # 添加新用户
             r_user.set(key, json.dumps(user_data).encode('utf-8'))
-            # 调用创建钩子
             hooks.call_user_created(user_id, user_data, r_user)
-            return {"message": "User added successfully", "user": user_data}
+            payload_user = user_data
+            msg = "User added successfully"
+        from apis.estore_b_identity import ensure_manager_extension_if_missing
+
+        ensure_manager_extension_if_missing(user_id)
+        return {"message": msg, "user": payload_user}
 
     @app.post("/api/delete_user")
     async def delete_user(user_data: dict):
@@ -239,7 +280,11 @@ def register_user_apis(
         
         # 调用删除钩子（在删除之前调用，以便清理相关数据）
         hooks.call_user_deleted(user_id, user_data_backup, r_user)
-        
+
+        from apis.estore_b_identity import delete_manager_extension_for_flow_user
+
+        delete_manager_extension_for_flow_user(user_id)
+
         r_user.delete(key)
 
         # 备份已删除用户数据至 deleted_user 表
@@ -417,7 +462,7 @@ def register_user_apis(
         authorization: str = Header(None)
     ):
         """
-        上传用户头像到腾讯云 COS（使用默认 bucket）
+        上传用户头像到腾讯云 COS（bucket 见 config_default.USER_SYSTEM_COS_BUCKET，可由各实例 config.py 覆盖）
         前端已处理图片格式转换和文件重命名
         
         参数:
@@ -438,7 +483,9 @@ def register_user_apis(
                 raise HTTPException(status_code=403, detail="Invalid access token")
             
             # 直接使用前端传来的文件（已重命名为用户ID）
-            file_url = file_to_url(file, folder_name="AVATARS")
+            file_url = file_to_url(
+                file, folder_name="AVATARS", bucket=USER_SYSTEM_COS_BUCKET
+            )
             
             return {
                 "status": "success",
