@@ -16,8 +16,19 @@ import json
 import uuid
 import redis
 import os
-from config_default import USER_SYSTEM_COS_BUCKET
 from .cos_upload import file_to_url
+
+# Flops 使用可选的 config.py，无 config_default 模块；与 cos_upload.file_to_url 默认 bucket 一致
+_DEFAULT_USER_SYSTEM_COS_BUCKET = "flowtask-1302933783"
+try:
+    import config as _config  # type: ignore
+    _bucket = getattr(_config, "USER_SYSTEM_COS_BUCKET", None)
+    if isinstance(_bucket, str) and _bucket.strip():
+        USER_SYSTEM_COS_BUCKET = _bucket.strip()
+    else:
+        USER_SYSTEM_COS_BUCKET = _DEFAULT_USER_SYSTEM_COS_BUCKET
+except ImportError:
+    USER_SYSTEM_COS_BUCKET = _DEFAULT_USER_SYSTEM_COS_BUCKET
 from .hooks import UserHooks
 
 # Redis 默认连接配置（可被 init_user_redis 参数覆盖）
@@ -462,7 +473,7 @@ def register_user_apis(
         authorization: str = Header(None)
     ):
         """
-        上传用户头像到腾讯云 COS（bucket 见 config_default.USER_SYSTEM_COS_BUCKET，可由各实例 config.py 覆盖）
+        上传用户头像到腾讯云 COS（bucket 优先 config.USER_SYSTEM_COS_BUCKET，否则与 cos_upload 默认 bucket 相同）
         前端已处理图片格式转换和文件重命名
         
         参数:
