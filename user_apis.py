@@ -11,7 +11,7 @@ User APIs
 
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
 from fastapi.responses import JSONResponse
-from typing import Optional
+from typing import Callable, Optional
 import json
 import uuid
 import redis
@@ -168,6 +168,8 @@ def register_user_apis(
     redis_host: Optional[str] = None,
     redis_port: Optional[int] = None,
     redis_db: Optional[int] = None,
+    after_user_saved: Optional[Callable[[str], None]] = None,
+    before_user_key_deleted: Optional[Callable[[str], None]] = None,
 ):
     """
     注册所有用户相关的 API 路由和数据库初始化
@@ -177,6 +179,8 @@ def register_user_apis(
       hooks: 可选的用户操作钩子，用于在用户创建/更新/删除时执行自定义逻辑
       register_redis_init: 若为 False，则不再注册 init_user_redis（适用于已在别处调用过 init_user_redis 的场景）
       redis_host/redis_port/redis_db: 用户系统 Redis 覆盖配置
+      after_user_saved: 宿主集成回调。在 Redis 写入 user:{id} 且已调用 hooks 的 created/updated 之后执行，签名为 (user_id) -> None；异常会向上抛出（与原先内联业务逻辑一致）。
+      before_user_key_deleted: 宿主集成回调。在 hooks.call_user_deleted 之后、删除 user:{id} 键之前执行，签名为 (user_id) -> None；用于清理依赖 Flow 用户 ID 的扩展数据等。
     
     返回:
       get_current_user_id: 可用于 Depends 的依赖函数，用于获取当前用户ID
@@ -270,9 +274,8 @@ def register_user_apis(
             hooks.call_user_created(user_id, user_data, r_user)
             payload_user = user_data
             msg = "User added successfully"
-        from apis.estore_b_identity import ensure_manager_extension_if_missing
-
-        ensure_manager_extension_if_missing(user_id)
+        if after_user_saved is not None:
+            after_user_saved(user_id)
         return {"message": msg, "user": payload_user}
 
     @app.post("/api/delete_user")
@@ -292,9 +295,8 @@ def register_user_apis(
         # 调用删除钩子（在删除之前调用，以便清理相关数据）
         hooks.call_user_deleted(user_id, user_data_backup, r_user)
 
-        from apis.estore_b_identity import delete_manager_extension_for_flow_user
-
-        delete_manager_extension_for_flow_user(user_id)
+        if before_user_key_deleted is not None:
+            before_user_key_deleted(user_id)
 
         r_user.delete(key)
 
