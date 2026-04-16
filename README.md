@@ -37,6 +37,27 @@ app = FastAPI()
 register_user_apis(app)
 ```
 
+### 自定义 Redis（例如 E-Store 管理员库用 db=6）
+
+```python
+from fastapi import FastAPI
+from user_system import register_user_apis
+
+app = FastAPI()
+
+register_user_apis(
+    app,
+    redis_host="127.0.0.1",
+    redis_port=6379,
+    redis_db=6,
+)
+```
+
+也支持环境变量覆盖：
+- `FLOWSYS_REDIS_HOST`
+- `FLOWSYS_REDIS_PORT`
+- `FLOWSYS_REDIS_DB`
+
 ### 使用 Hook 扩展功能
 
 ```python
@@ -122,6 +143,18 @@ async def protected_endpoint(user_id: str = Depends(get_current_user_id)):
     return {"user_id": user_id}
 ```
 
+### 获取用户系统 Redis 对象（给业务层写扩展数据）
+
+```python
+from user_system import get_user_redis
+
+@app.post("/api/biz/write")
+async def write_biz_data():
+    r_user = get_user_redis(app)
+    r_user.set("estore_manager:steven", '{"allowed_store_ids":["e-store-00"]}')
+    return {"ok": True}
+```
+
 ## API 端点
 
 ### 用户管理
@@ -144,10 +177,10 @@ async def protected_endpoint(user_id: str = Depends(get_current_user_id)):
 
 ## 配置
 
-模块使用硬编码的 Redis 配置：
+模块默认 Redis 配置：
 - Host: `127.0.0.1`
 - Port: `6379`
-- Database: `7` (用户系统数据库)
+- Database: `7`（可通过 `register_user_apis(..., redis_db=...)` 或环境变量覆盖）
 
 ## 数据结构
 
