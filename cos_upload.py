@@ -25,7 +25,14 @@ def file_to_url(file, folder_name="", bucket="flowtask-1302933783", cos_filename
     secret_key = '***REDACTED***'
     region = 'ap-guangzhou'
     scheme = 'https'
-    config = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key, Scheme=scheme)
+    # 显式禁用代理：与 arXiv 等出站代理分离，避免进程环境变量 HTTPS_PROXY 让 COS 误走代理
+    config = CosConfig(
+        Region=region,
+        SecretId=secret_id,
+        SecretKey=secret_key,
+        Scheme=scheme,
+        Proxies={},
+    )
     client = CosS3Client(config)
 
     # 处理文件夹名称，确保以 "/" 结尾（如果传入非空）
