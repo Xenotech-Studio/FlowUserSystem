@@ -119,7 +119,14 @@ def bytes_to_cos_url(
     secret_id, secret_key = get_tencent_credentials()
     region = "ap-guangzhou"
     scheme = "https"
-    cfg = CosConfig(Region=region, SecretId=secret_id, SecretKey=secret_key, Scheme=scheme)
+    # 与 file_to_url 一致：避免环境变量代理影响 COS
+    cfg = CosConfig(
+        Region=region,
+        SecretId=secret_id,
+        SecretKey=secret_key,
+        Scheme=scheme,
+        Proxies={},
+    )
     client = CosS3Client(cfg)
 
     folder = folder_name + "/" if (folder_name and not folder_name.endswith("/")) else folder_name
