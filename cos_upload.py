@@ -114,8 +114,6 @@ def bytes_to_cos_url(
 
     用于服务端生成可给执行端直连下载的链接（例如技能包 zip 缓存）。
     """
-    if not body:
-        raise ValueError("body is empty")
     secret_id, secret_key = get_tencent_credentials()
     region = "ap-guangzhou"
     scheme = "https"
