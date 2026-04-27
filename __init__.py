@@ -14,7 +14,7 @@ from .user_apis import (
     self_userinfo_keys_mask,
 )
 from .hooks import UserHooks
-from .cos_upload import file_to_url, bytes_to_cos_url
+from .cos_upload import file_to_url, bytes_to_cos_url, multipart_upload_from_chunk_queue
 
 __all__ = [
     "register_user_apis",
@@ -26,6 +26,7 @@ __all__ = [
     "UserHooks",
     "file_to_url",
     "bytes_to_cos_url",
+    "multipart_upload_from_chunk_queue",
     "visitor_userinfo_keys",
     "self_userinfo_keys_mask",
 ]
