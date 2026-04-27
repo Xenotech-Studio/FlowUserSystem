@@ -7,7 +7,7 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Optional
+from typing import Callable, Optional
 
 from qcloud_cos import CosConfig, CosS3Client
 import logging
@@ -29,6 +29,24 @@ def get_tencent_credentials():
     except ImportError:
         pass
     return _DEFAULT_SECRET_ID, _DEFAULT_SECRET_KEY
+
+
+class _CosUploadCountingReader:
+    """包装 BytesIO：COS SDK 每次 read 后回调 (bytes_consumed, total)，用于上报上传进度。"""
+
+    def __init__(self, data: bytes, on_read: Callable[[int, int], None]) -> None:
+        self._io = BytesIO(data)
+        self._on_read = on_read
+        self._total = len(data)
+
+    def read(self, amt: int = -1) -> bytes:
+        b = self._io.read(amt)
+        if b:
+            self._on_read(self._io.tell(), self._total)
+        return b
+
+    def seek(self, pos: int, whence: int = 0) -> int:
+        return self._io.seek(pos, whence)
 
 
 def file_to_url(file, folder_name="", bucket="flowtask-1302933783", cos_filename=None, download_filename=None):
@@ -108,11 +126,13 @@ def bytes_to_cos_url(
     object_name: str = "file.bin",
     bucket: str = "flowtask-1302933783",
     content_type: Optional[str] = None,
+    on_body_read_progress: Optional[Callable[[int, int], None]] = None,
 ) -> str:
     """
     将内存中的字节上传到 COS，返回公网 HTTPS URL（与 file_to_url 同桶、同地域、同鉴权）。
 
     用于服务端生成可给执行端直连下载的链接（例如技能包 zip 缓存）。
+    on_body_read_progress：可选；COS SDK 从 Body 读取时回调 (已读字节, 总字节)。
     """
     secret_id, secret_key = get_tencent_credentials()
     region = "ap-guangzhou"
@@ -132,9 +152,12 @@ def bytes_to_cos_url(
     key = folder + safe_name
     image_url = cfg.uri(bucket=bucket, path=key)
 
+    body_stream: object = BytesIO(body)
+    if on_body_read_progress is not None:
+        body_stream = _CosUploadCountingReader(body, on_body_read_progress)
     upload_params: dict = {
         "Bucket": bucket,
-        "Body": BytesIO(body),
+        "Body": body_stream,
         "Key": key,
         "StorageClass": "STANDARD",
         "EnableMD5": False,
