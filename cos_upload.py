@@ -7,7 +7,8 @@
 from __future__ import annotations
 
 from io import BytesIO
-from typing import Callable, Optional
+from queue import Queue
+from typing import Any, Callable, List, Optional, Tuple
 
 from qcloud_cos import CosConfig, CosS3Client
 import logging
@@ -168,4 +169,151 @@ def bytes_to_cos_url(
     client.put_object(**upload_params)
     logging.info("Bytes uploaded to COS: %s", image_url)
     return image_url
+
+
+def multipart_upload_from_chunk_queue(
+    q: "Queue[Tuple[str, Any]]",
+    *,
+    folder_name: str = "",
+    object_name: str = "file.bin",
+    bucket: str = "flowtask-1302933783",
+    content_type: Optional[str] = None,
+    on_cos_bytes: Optional[Callable[[int], None]] = None,
+    part_size: int = 5 * 1024 * 1024,
+) -> str:
+    """
+    从队列拉取 (\"data\", chunk) / (\"end\", None) / (\"err\", msg)，边收边 multipart 上传到 COS。
+    单 part 最小 part_size（末 part 可更小）；空文件走 put_object。
+    """
+    secret_id, secret_key = get_tencent_credentials()
+    region = "ap-guangzhou"
+    scheme = "https"
+    cfg = CosConfig(
+        Region=region,
+        SecretId=secret_id,
+        SecretKey=secret_key,
+        Scheme=scheme,
+        Proxies={},
+    )
+    client = CosS3Client(cfg)
+
+    folder = folder_name + "/" if (folder_name and not folder_name.endswith("/")) else folder_name
+    safe_name = (object_name or "file.bin").split("/")[-1]
+    key = folder + safe_name
+    image_url = cfg.uri(bucket=bucket, path=key)
+
+    buffer = bytearray()
+    uploaded = 0
+    upload_id: Optional[str] = None
+    parts: List[dict] = []
+    part_number = 1
+
+    def _report_cos() -> None:
+        """已确认上传的字节 + 仍待 upload_part 的缓冲，单调递增；避免 < part_size 时长期不报导致进度条卡在 0。"""
+        if on_cos_bytes is not None:
+            on_cos_bytes(int(uploaded) + len(buffer))
+
+    def _flush(force: bool = False) -> None:
+        nonlocal buffer, uploaded, part_number, parts
+        while len(buffer) >= part_size or (force and buffer):
+            take = len(buffer) if force else part_size
+            if take <= 0:
+                break
+            body = bytes(buffer[:take])
+            del buffer[:take]
+            if not upload_id:
+                raise RuntimeError("multipart_upload_from_chunk_queue: internal state error (no upload_id)")
+            up = client.upload_part(
+                Bucket=bucket,
+                Key=key,
+                PartNumber=part_number,
+                UploadId=upload_id,
+                Body=body,
+            )
+            etag_raw = up.get("ETag") or ""
+            etag = str(etag_raw).strip().strip('"')
+            parts.append({"PartNumber": part_number, "ETag": etag})
+            part_number += 1
+            uploaded += len(body)
+            _report_cos()
+
+    try:
+        while True:
+            kind, payload = q.get()
+            if kind == "err":
+                raise ValueError(str(payload) if payload is not None else "upload aborted")
+            if kind == "end":
+                break
+            if kind != "data":
+                continue
+            chunk = payload if isinstance(payload, (bytes, bytearray)) else bytes(payload)
+            if not chunk:
+                continue
+            if upload_id is None:
+                extra: dict = {"Bucket": bucket, "Key": key}
+                if content_type and str(content_type).strip():
+                    extra["ContentType"] = str(content_type).strip()
+                cre = client.create_multipart_upload(**extra)
+                upload_id = cre.get("UploadId")
+                if not upload_id:
+                    raise RuntimeError("create_multipart_upload missing UploadId")
+            buffer.extend(chunk)
+            _flush(force=False)
+            _report_cos()
+
+        if upload_id is None:
+            if buffer:
+                extra_put: dict = {
+                    "Bucket": bucket,
+                    "Key": key,
+                    "Body": bytes(buffer),
+                    "StorageClass": "STANDARD",
+                    "EnableMD5": False,
+                }
+                if content_type and str(content_type).strip():
+                    extra_put["ContentType"] = str(content_type).strip()
+                client.put_object(**extra_put)
+                n = len(buffer)
+                buffer.clear()
+                uploaded = n
+                _report_cos()
+            else:
+                extra_put = {
+                    "Bucket": bucket,
+                    "Key": key,
+                    "Body": b"",
+                    "StorageClass": "STANDARD",
+                    "EnableMD5": False,
+                }
+                if content_type and str(content_type).strip():
+                    extra_put["ContentType"] = str(content_type).strip()
+                client.put_object(**extra_put)
+                uploaded = 0
+                _report_cos()
+            logging.info("Stream uploaded to COS (put_object): %s", image_url)
+            return image_url
+
+        _flush(force=True)
+        _report_cos()
+        if not parts:
+            client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            raise RuntimeError("multipart upload: no parts")
+
+        parts_sorted = sorted(parts, key=lambda x: int(x["PartNumber"]))
+        # 腾讯云 qcloud_cos 的 dict_to_xml 要求键名为 Part（列表），用 Parts 会得到「Part Is Required」
+        client.complete_multipart_upload(
+            Bucket=bucket,
+            Key=key,
+            UploadId=upload_id,
+            MultipartUpload={"Part": parts_sorted},
+        )
+        logging.info("Stream uploaded to COS (multipart): %s", image_url)
+        return image_url
+    except Exception:
+        if upload_id:
+            try:
+                client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            except Exception:
+                pass
+        raise
 
