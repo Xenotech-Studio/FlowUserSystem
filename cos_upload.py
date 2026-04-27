@@ -1,7 +1,15 @@
 """
-腾讯云 COS 文件上传工具
-提供通用的文件上传功能，供用户系统和其他模块使用。
-密钥：优先从 config.TENCENT_SECRET_ID / TENCENT_SECRET_KEY 读取，否则使用下方默认（与联网搜索等腾讯云 API 共用）。
+腾讯云 COS 上传工具：纯传输层。
+
+三个 primitive 互相不知道彼此的业务用途，只接 (folder_name, object_name)：
+- file_to_url：UploadFile 一次性 put_object（旧接口，沿用 cos_filename / download_filename 兼容旧调用方）
+- bytes_to_cos_url：内存 bytes 一次性 put_object
+- multipart_upload_from_chunk_queue：从 (kind, payload) chunk 队列边收边 multipart 上传
+
+CHAT_FILES / AVATARS / DESKTOP_UPDATES 等「上传到 COS 内哪个目录」的策略由调用方决定，
+本模块只负责拼 key、构造客户端、调 SDK，方便上层换桶/换策略不动传输代码。
+
+密钥：优先 config.TENCENT_SECRET_ID / TENCENT_SECRET_KEY，否则用模块内默认值（与联网搜索等腾讯云 API 共用）。
 """
 
 from __future__ import annotations
@@ -18,6 +26,11 @@ import sys
 _DEFAULT_SECRET_ID = "***REDACTED***"
 _DEFAULT_SECRET_KEY = "***REDACTED***"
 
+# 默认桶 / 区域 / 协议（三个 primitive 共用，避免散在各处再写一遍）
+_DEFAULT_BUCKET = "flowtask-1302933783"
+_DEFAULT_REGION = "ap-guangzhou"
+_DEFAULT_SCHEME = "https"
+
 
 def get_tencent_credentials():
     """返回 (secret_id, secret_key)，供 COS、联网搜索等腾讯云 API 共用。优先 config，否则默认值。"""
@@ -30,6 +43,48 @@ def get_tencent_credentials():
     except ImportError:
         pass
     return _DEFAULT_SECRET_ID, _DEFAULT_SECRET_KEY
+
+
+def _make_cos_client(
+    *,
+    bucket: Optional[str] = None,
+    region: Optional[str] = None,
+    scheme: Optional[str] = None,
+) -> Tuple[CosConfig, CosS3Client, str]:
+    """
+    构造一对 (CosConfig, CosS3Client, resolved_bucket)。
+
+    显式 Proxies={}：与 arXiv / 搜索等共用同一进程时，环境变量 HTTPS_PROXY 可能让 COS 误走代理，强制清空。
+    """
+    sid, sk = get_tencent_credentials()
+    cfg = CosConfig(
+        Region=region or _DEFAULT_REGION,
+        SecretId=sid,
+        SecretKey=sk,
+        Scheme=scheme or _DEFAULT_SCHEME,
+        Proxies={},
+    )
+    return cfg, CosS3Client(cfg), (bucket or _DEFAULT_BUCKET)
+
+
+def _resolve_cos_key(folder_name: str, object_name: str) -> Tuple[str, str]:
+    """
+    根据 folder_name + object_name 返回 (key, safe_basename)。
+
+    - folder_name 末尾自动补 '/'（空串保留为空）。
+    - object_name 仅取末段 basename，防止上层不慎传 'a/b/c' 把目录切坏。
+    """
+    folder = (folder_name + "/") if (folder_name and not folder_name.endswith("/")) else (folder_name or "")
+    safe = (object_name or "file.bin").rsplit("/", 1)[-1].rsplit("\\", 1)[-1] or "file.bin"
+    return folder + safe, safe
+
+
+def _content_disposition_attachment(download_filename: Optional[str]) -> Optional[str]:
+    """download_filename 非空时返回 'attachment; filename=...'，让浏览器下载用指定名字。"""
+    if not download_filename:
+        return None
+    dl = download_filename.rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
+    return f'attachment; filename="{dl}"'
 
 
 class _CosUploadCountingReader:
@@ -50,72 +105,44 @@ class _CosUploadCountingReader:
         return self._io.seek(pos, whence)
 
 
-def file_to_url(file, folder_name="", bucket="flowtask-1302933783", cos_filename=None, download_filename=None):
+def file_to_url(
+    file,
+    folder_name: str = "",
+    bucket: str = _DEFAULT_BUCKET,
+    cos_filename: Optional[str] = None,
+    download_filename: Optional[str] = None,
+):
     """
-    上传文件到腾讯云 COS
-    
+    上传 UploadFile 到腾讯云 COS（位置参数兼容旧调用方）。
+
     参数：
-      file: UploadFile 对象，包含文件名及文件流
-      folder_name: 上传的目标子文件夹，可选
-      bucket: COS bucket 名称，默认为 "flowtask-1302933783"
-      cos_filename: COS中存储的文件名（可选，如果提供则使用此名称，否则使用原始文件名）
-      download_filename: 下载时展示的文件名（可选，设置后会添加 Content-Disposition 头，让浏览器下载时显示指定文件名）
-    返回值：
-      上传后的文件 URL
+      file: UploadFile（含 filename 与 .file 流）
+      folder_name: COS key 前缀目录（不含末段文件名），由调用方决定策略
+      bucket: COS bucket
+      cos_filename: COS key 末段；不传则取 file.filename 的 basename
+      download_filename: 设置 Content-Disposition，让浏览器下载时用指定名字
+
+    返回：上传后的公网 HTTPS URL
     """
     logging.basicConfig(level=logging.INFO, stream=sys.stdout)
-    secret_id, secret_key = get_tencent_credentials()
-    region = "ap-guangzhou"
-    scheme = 'https'
-    # 显式禁用代理：与 arXiv 等出站代理分离，避免进程环境变量 HTTPS_PROXY 让 COS 误走代理
-    config = CosConfig(
-        Region=region,
-        SecretId=secret_id,
-        SecretKey=secret_key,
-        Scheme=scheme,
-        Proxies={},
-    )
-    client = CosS3Client(config)
 
-    # 处理文件夹名称，确保以 "/" 结尾（如果传入非空）
-    folder = folder_name + "/" if (folder_name and not folder_name.endswith("/")) else folder_name
-    
-    # 如果提供了cos_filename，使用它；否则使用原始文件名
-    if cos_filename:
-        file_name = cos_filename
-    else:
-        # 使用 UploadFile 的 filename 属性
-        file_name = file.filename
-        file_name = file_name.split('/')[-1]  # 仅保留文件名部分
-    
-    # key = 'IMAGES/' + folder + file_name
-    key = folder + file_name
+    cfg, client, bucket_resolved = _make_cos_client(bucket=bucket)
+    object_name = cos_filename if cos_filename else (getattr(file, "filename", None) or "file.bin")
+    key, _ = _resolve_cos_key(folder_name, object_name)
+    image_url = cfg.uri(bucket=bucket_resolved, path=key)
 
-    # 构造图片 URL（使用 sdk 的 uri 方法）
-    image_url = config.uri(bucket=bucket, path=key)
-
-    # Content-Disposition 让浏览器下载时显示指定文件名
-    content_disposition = None
-    if download_filename:
-        # 防止包含路径，只保留名称
-        dl_name = download_filename.split('/')[-1]
-        content_disposition = f'attachment; filename="{dl_name}"'
-
-    # 准备上传参数
-    upload_params = {
-        'Bucket': bucket,
-        'Body': file.file,
-        'Key': key,
-        'StorageClass': 'STANDARD',
-        'EnableMD5': False
+    upload_params: dict = {
+        "Bucket": bucket_resolved,
+        "Body": file.file,
+        "Key": key,
+        "StorageClass": "STANDARD",
+        "EnableMD5": False,
     }
-    
-    # 如果设置了 download_filename，添加 ContentDisposition
-    if content_disposition:
-        upload_params['ContentDisposition'] = content_disposition
+    cd = _content_disposition_attachment(download_filename)
+    if cd:
+        upload_params["ContentDisposition"] = cd
 
-    # 使用文件的 file 属性直接获取文件流上传
-    response = client.put_object(**upload_params)
+    client.put_object(**upload_params)
     logging.info("Image uploaded to COS: %s", image_url)
     return image_url
 
@@ -125,39 +152,26 @@ def bytes_to_cos_url(
     *,
     folder_name: str = "",
     object_name: str = "file.bin",
-    bucket: str = "flowtask-1302933783",
+    bucket: str = _DEFAULT_BUCKET,
     content_type: Optional[str] = None,
     on_body_read_progress: Optional[Callable[[int, int], None]] = None,
 ) -> str:
     """
-    将内存中的字节上传到 COS，返回公网 HTTPS URL（与 file_to_url 同桶、同地域、同鉴权）。
+    把内存中的字节上传到 COS，返回公网 HTTPS URL（与 file_to_url 同桶/同地域/同鉴权）。
 
-    用于服务端生成可给执行端直连下载的链接（例如技能包 zip 缓存）。
     on_body_read_progress：可选；COS SDK 从 Body 读取时回调 (已读字节, 总字节)。
     """
-    secret_id, secret_key = get_tencent_credentials()
-    region = "ap-guangzhou"
-    scheme = "https"
-    # 与 file_to_url 一致：避免环境变量代理影响 COS
-    cfg = CosConfig(
-        Region=region,
-        SecretId=secret_id,
-        SecretKey=secret_key,
-        Scheme=scheme,
-        Proxies={},
+    cfg, client, bucket_resolved = _make_cos_client(bucket=bucket)
+    key, _ = _resolve_cos_key(folder_name, object_name)
+    image_url = cfg.uri(bucket=bucket_resolved, path=key)
+
+    body_stream: object = (
+        _CosUploadCountingReader(body, on_body_read_progress)
+        if on_body_read_progress is not None
+        else BytesIO(body)
     )
-    client = CosS3Client(cfg)
-
-    folder = folder_name + "/" if (folder_name and not folder_name.endswith("/")) else folder_name
-    safe_name = (object_name or "file.bin").split("/")[-1]
-    key = folder + safe_name
-    image_url = cfg.uri(bucket=bucket, path=key)
-
-    body_stream: object = BytesIO(body)
-    if on_body_read_progress is not None:
-        body_stream = _CosUploadCountingReader(body, on_body_read_progress)
     upload_params: dict = {
-        "Bucket": bucket,
+        "Bucket": bucket_resolved,
         "Body": body_stream,
         "Key": key,
         "StorageClass": "STANDARD",
@@ -176,31 +190,20 @@ def multipart_upload_from_chunk_queue(
     *,
     folder_name: str = "",
     object_name: str = "file.bin",
-    bucket: str = "flowtask-1302933783",
+    bucket: str = _DEFAULT_BUCKET,
     content_type: Optional[str] = None,
     on_cos_bytes: Optional[Callable[[int], None]] = None,
     part_size: int = 5 * 1024 * 1024,
 ) -> str:
     """
     从队列拉取 (\"data\", chunk) / (\"end\", None) / (\"err\", msg)，边收边 multipart 上传到 COS。
-    单 part 最小 part_size（末 part 可更小）；空文件走 put_object。
-    """
-    secret_id, secret_key = get_tencent_credentials()
-    region = "ap-guangzhou"
-    scheme = "https"
-    cfg = CosConfig(
-        Region=region,
-        SecretId=secret_id,
-        SecretKey=secret_key,
-        Scheme=scheme,
-        Proxies={},
-    )
-    client = CosS3Client(cfg)
 
-    folder = folder_name + "/" if (folder_name and not folder_name.endswith("/")) else folder_name
-    safe_name = (object_name or "file.bin").split("/")[-1]
-    key = folder + safe_name
-    image_url = cfg.uri(bucket=bucket, path=key)
+    单 part 最小 part_size（末 part 可更小）；空文件走 put_object。
+    与 bytes_to_cos_url 共享 _make_cos_client / _resolve_cos_key，确保 bucket/region/scheme/key 拼法一致。
+    """
+    cfg, client, bucket_resolved = _make_cos_client(bucket=bucket)
+    key, _ = _resolve_cos_key(folder_name, object_name)
+    image_url = cfg.uri(bucket=bucket_resolved, path=key)
 
     buffer = bytearray()
     uploaded = 0
@@ -224,7 +227,7 @@ def multipart_upload_from_chunk_queue(
             if not upload_id:
                 raise RuntimeError("multipart_upload_from_chunk_queue: internal state error (no upload_id)")
             up = client.upload_part(
-                Bucket=bucket,
+                Bucket=bucket_resolved,
                 Key=key,
                 PartNumber=part_number,
                 UploadId=upload_id,
@@ -250,7 +253,7 @@ def multipart_upload_from_chunk_queue(
             if not chunk:
                 continue
             if upload_id is None:
-                extra: dict = {"Bucket": bucket, "Key": key}
+                extra: dict = {"Bucket": bucket_resolved, "Key": key}
                 if content_type and str(content_type).strip():
                     extra["ContentType"] = str(content_type).strip()
                 cre = client.create_multipart_upload(**extra)
@@ -262,47 +265,32 @@ def multipart_upload_from_chunk_queue(
             _report_cos()
 
         if upload_id is None:
-            if buffer:
-                extra_put: dict = {
-                    "Bucket": bucket,
-                    "Key": key,
-                    "Body": bytes(buffer),
-                    "StorageClass": "STANDARD",
-                    "EnableMD5": False,
-                }
-                if content_type and str(content_type).strip():
-                    extra_put["ContentType"] = str(content_type).strip()
-                client.put_object(**extra_put)
-                n = len(buffer)
-                buffer.clear()
-                uploaded = n
-                _report_cos()
-            else:
-                extra_put = {
-                    "Bucket": bucket,
-                    "Key": key,
-                    "Body": b"",
-                    "StorageClass": "STANDARD",
-                    "EnableMD5": False,
-                }
-                if content_type and str(content_type).strip():
-                    extra_put["ContentType"] = str(content_type).strip()
-                client.put_object(**extra_put)
-                uploaded = 0
-                _report_cos()
+            extra_put: dict = {
+                "Bucket": bucket_resolved,
+                "Key": key,
+                "Body": bytes(buffer) if buffer else b"",
+                "StorageClass": "STANDARD",
+                "EnableMD5": False,
+            }
+            if content_type and str(content_type).strip():
+                extra_put["ContentType"] = str(content_type).strip()
+            client.put_object(**extra_put)
+            uploaded = len(buffer)
+            buffer.clear()
+            _report_cos()
             logging.info("Stream uploaded to COS (put_object): %s", image_url)
             return image_url
 
         _flush(force=True)
         _report_cos()
         if not parts:
-            client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+            client.abort_multipart_upload(Bucket=bucket_resolved, Key=key, UploadId=upload_id)
             raise RuntimeError("multipart upload: no parts")
 
         parts_sorted = sorted(parts, key=lambda x: int(x["PartNumber"]))
         # 腾讯云 qcloud_cos 的 dict_to_xml 要求键名为 Part（列表），用 Parts 会得到「Part Is Required」
         client.complete_multipart_upload(
-            Bucket=bucket,
+            Bucket=bucket_resolved,
             Key=key,
             UploadId=upload_id,
             MultipartUpload={"Part": parts_sorted},
@@ -312,8 +300,7 @@ def multipart_upload_from_chunk_queue(
     except Exception:
         if upload_id:
             try:
-                client.abort_multipart_upload(Bucket=bucket, Key=key, UploadId=upload_id)
+                client.abort_multipart_upload(Bucket=bucket_resolved, Key=key, UploadId=upload_id)
             except Exception:
                 pass
         raise
-
