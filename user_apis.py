@@ -411,6 +411,51 @@ def register_user_apis(
         user = json.loads(user_raw)
         return {"message": "Login validated successfully", "user": user, "device_name": device_name}
 
+    @app.get("/api/my_sessions")
+    async def my_sessions(authorization: str = Header(None)):
+        """
+        列出当前账号下全部有效登录会话（Redis access_token）。
+        需 Authorization: Bearer <当前 access_token>。
+        返回每条含 access_token（供调用方登出该会话）、device_name、expires_in_seconds、is_current。
+        """
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Authorization header is required")
+        bearer = authorization[7:].strip()
+        if not bearer:
+            raise HTTPException(status_code=401, detail="Invalid authorization token")
+        r_user = app.state.redis_user
+        user_id = get_user_id_from_token(bearer, r_user)
+        if not user_id:
+            raise HTTPException(status_code=403, detail="Invalid access token")
+        prefix = f"access_token:{user_id}:"
+        raw_keys = r_user.keys(f"{prefix}*")
+        sessions = []
+        for token_key in raw_keys:
+            if not token_key:
+                continue
+            key_s = token_key.decode("utf-8") if isinstance(token_key, (bytes, bytearray)) else str(token_key)
+            parts = key_s.split(":")
+            if len(parts) < 3:
+                continue
+            sess_token = parts[-1]
+            val_raw = r_user.get(token_key)
+            device_name = val_raw.decode("utf-8") if val_raw else ""
+            ttl = r_user.ttl(token_key)
+            if ttl is None or ttl < 0:
+                ttl_sec = 0
+            else:
+                ttl_sec = int(ttl)
+            sessions.append(
+                {
+                    "access_token": sess_token,
+                    "device_name": device_name or "未知设备",
+                    "expires_in_seconds": ttl_sec,
+                    "is_current": sess_token == bearer,
+                }
+            )
+        sessions.sort(key=lambda s: (not s["is_current"], s["device_name"] or ""))
+        return {"sessions": sessions}
+
     @app.post("/api/logout")
     async def logout(logout_request: dict):
         """Logout user from a specific device"""
