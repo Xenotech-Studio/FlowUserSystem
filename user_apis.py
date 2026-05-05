@@ -11,12 +11,17 @@ User APIs
 
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
 from fastapi.responses import JSONResponse
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 import json
 import uuid
+import warnings
 import redis
 import os
-from .cos_upload import file_to_url
+
+# 历史遗留：上传能力曾内嵌在 user_system 内（self.cos_upload）。
+# 现在已抽到独立 submodule flow_upload。register_user_apis 支持以参数注入
+# file_to_url；为 None 时回退到 self.cos_upload（带 DeprecationWarning），
+# 兼容尚未切换到 flow_upload 的接入方。
 
 # Flops 使用可选的 config.py，无 config_default 模块；与 cos_upload.file_to_url 默认 bucket 一致
 _DEFAULT_USER_SYSTEM_COS_BUCKET = "flowtask-1302933783"
@@ -170,6 +175,9 @@ def register_user_apis(
     redis_db: Optional[int] = None,
     after_user_saved: Optional[Callable[[str], None]] = None,
     before_user_key_deleted: Optional[Callable[[str], None]] = None,
+    file_to_url: Optional[Callable[..., str]] = None,
+    avatar_bucket: Optional[str] = None,
+    avatar_folder: str = "AVATARS",
 ):
     """
     注册所有用户相关的 API 路由和数据库初始化
@@ -181,6 +189,11 @@ def register_user_apis(
       redis_host/redis_port/redis_db: 用户系统 Redis 覆盖配置
       after_user_saved: 宿主集成回调。在 Redis 写入 user:{id} 且已调用 hooks 的 created/updated 之后执行，签名为 (user_id) -> None；异常会向上抛出（与原先内联业务逻辑一致）。
       before_user_key_deleted: 宿主集成回调。在 hooks.call_user_deleted 之后、删除 user:{id} 键之前执行，签名为 (user_id) -> None；用于清理依赖 Flow 用户 ID 的扩展数据等。
+      file_to_url: 头像上传函数（签名 (file, folder_name=..., bucket=..., ...) → 公网 URL）。
+                   推荐传入 `flow_upload.file_to_url`。为 None 时回退到 user_system 自带的
+                   `cos_upload.file_to_url`（已废弃，会发 DeprecationWarning）。
+      avatar_bucket: 头像 COS bucket；不传时使用模块级 `USER_SYSTEM_COS_BUCKET` 的解析值。
+      avatar_folder: 头像 COS 路径前缀（默认 "AVATARS"）。
     
     返回:
       get_current_user_id: 可用于 Depends 的依赖函数，用于获取当前用户ID
@@ -195,6 +208,24 @@ def register_user_apis(
     
     # 创建 get_current_user_id 依赖函数
     get_current_user_id_dep = create_get_current_user_id_dependency(app)
+
+    # ----- 解析头像上传依赖 -----
+    # 优先级：注入 → 兼容回退到 self.cos_upload（带 deprecation 警告）
+    _avatar_file_to_url: Optional[Callable[..., str]] = file_to_url
+    if _avatar_file_to_url is None:
+        try:
+            from .cos_upload import file_to_url as _builtin_file_to_url  # type: ignore
+        except ImportError:
+            _builtin_file_to_url = None
+        if _builtin_file_to_url is not None:
+            warnings.warn(
+                "user_system.register_user_apis: 未注入 file_to_url，已回退到 user_system.cos_upload。"
+                " 推荐显式传入 flow_upload.file_to_url；user_system 内置上传实现将在未来版本移除。",
+                DeprecationWarning,
+                stacklevel=2,
+            )
+        _avatar_file_to_url = _builtin_file_to_url
+    _avatar_bucket = avatar_bucket if avatar_bucket else USER_SYSTEM_COS_BUCKET
     
     @app.get("/api/users")
     async def get_users(super_command: str = None):
@@ -514,54 +545,61 @@ def register_user_apis(
 
         return {"message": "Logged out from all devices successfully"}
 
-    @app.post("/api/upload_avatar")
-    async def upload_avatar_api(
-        file: UploadFile = File(...),
-        authorization: str = Header(None)
-    ):
-        """
-        上传用户头像到腾讯云 COS（bucket 优先 config.USER_SYSTEM_COS_BUCKET，否则与 cos_upload 默认 bucket 相同）
-        前端已处理图片格式转换和文件重命名
-        
-        参数:
-          file: 要上传的头像文件（前端已转换为PNG格式并以用户ID命名）
-          authorization: Bearer token，用于身份验证
-        
-        返回:
-          上传后的文件 URL
-        """
-        try:
-            # 验证用户身份
-            if not authorization:
-                raise HTTPException(status_code=401, detail="Authorization header is required")
+    if _avatar_file_to_url is None:
+        # 既没注入 file_to_url，也没找到内置 cos_upload —— 不注册头像 API。
+        # 调用方若需要头像功能，请显式传入 file_to_url=flow_upload.file_to_url。
+        pass
+    else:
+        @app.post("/api/upload_avatar")
+        async def upload_avatar_api(
+            file: UploadFile = File(...),
+            authorization: str = Header(None)
+        ):
+            """
+            上传用户头像到腾讯云 COS。bucket 优先 register_user_apis 的 avatar_bucket
+            参数；其次模块级 USER_SYSTEM_COS_BUCKET（来自宿主 config.py 或默认值）。
+            上传函数为 register_user_apis 注入的 file_to_url（推荐 flow_upload.file_to_url）。
+            前端已处理图片格式转换和文件重命名。
             
-            r_user = app.state.redis_user
-            user_id = get_current_user_id_dep(authorization)
-            if not user_id:
-                raise HTTPException(status_code=403, detail="Invalid access token")
+            参数:
+              file: 要上传的头像文件（前端已转换为PNG格式并以用户ID命名）
+              authorization: Bearer token，用于身份验证
             
-            # 直接使用前端传来的文件（已重命名为用户ID）
-            file_url = file_to_url(
-                file, folder_name="AVATARS", bucket=USER_SYSTEM_COS_BUCKET
-            )
-            
-            return {
-                "status": "success",
-                "message": "Avatar uploaded successfully",
-                "file_url": file_url,
-                "filename": file.filename
-            }
-        except HTTPException:
-            raise
-        except Exception as e:
-            return JSONResponse(
-                status_code=500,
-                content={
-                    "status": "error",
-                    "message": f"Failed to upload avatar: {str(e)}"
+            返回:
+              上传后的文件 URL
+            """
+            try:
+                # 验证用户身份
+                if not authorization:
+                    raise HTTPException(status_code=401, detail="Authorization header is required")
+                
+                r_user = app.state.redis_user
+                user_id = get_current_user_id_dep(authorization)
+                if not user_id:
+                    raise HTTPException(status_code=403, detail="Invalid access token")
+                
+                # 直接使用前端传来的文件（已重命名为用户ID）
+                file_url = _avatar_file_to_url(
+                    file, folder_name=avatar_folder, bucket=_avatar_bucket
+                )
+
+                return {
+                    "status": "success",
+                    "message": "Avatar uploaded successfully",
+                    "file_url": file_url,
+                    "filename": file.filename
                 }
-            )
-    
+            except HTTPException:
+                raise
+            except Exception as e:
+                return JSONResponse(
+                    status_code=500,
+                    content={
+                        "status": "error",
+                        "message": f"Failed to upload avatar: {str(e)}"
+                    }
+                )
+
     # 返回依赖函数供外部使用
     return get_current_user_id_dep
 
