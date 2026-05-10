@@ -13,6 +13,7 @@ from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
 from fastapi.responses import JSONResponse
 from typing import Any, Callable, Optional
 import json
+import time
 import uuid
 import warnings
 import redis
@@ -69,6 +70,45 @@ def check_access_token(token: str, user_id: str, redis_user: redis.Redis):
     token_value_raw = redis_user.get(key)
     device_name = token_value_raw.decode('utf-8') if token_value_raw else ""
     return True, device_name
+
+
+# -------------------- Token 元数据（is_manual 等）旁路存储 --------------------
+# access_token:{user_id}:{token}        →  device_name (str)        [主 key，向后兼容]
+# access_token_meta:{user_id}:{token}   →  JSON {"is_manual": ..., "created_at": ...}
+# 缺失 meta 视为登录产生的普通 token（is_manual=False）。
+
+def _token_meta_key(user_id: str, token: str) -> str:
+    return f"access_token_meta:{user_id}:{token}"
+
+
+def _load_token_meta(redis_user: redis.Redis, user_id: str, token: str) -> dict:
+    raw = redis_user.get(_token_meta_key(user_id, token))
+    if not raw:
+        return {}
+    try:
+        s = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        data = json.loads(s)
+        return data if isinstance(data, dict) else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _save_token_meta(redis_user: redis.Redis, user_id: str, token: str, meta: dict, ttl_seconds: Optional[int]) -> None:
+    """ttl_seconds=None 表示永不过期（与主 key 的 PERSIST 行为一致）。"""
+    key = _token_meta_key(user_id, token)
+    payload = json.dumps(meta, ensure_ascii=False).encode("utf-8")
+    if ttl_seconds is None:
+        redis_user.set(key, payload)
+    else:
+        redis_user.set(key, payload, ex=int(ttl_seconds))
+
+
+def _delete_token_meta(redis_user: redis.Redis, user_id: str, token: str) -> None:
+    redis_user.delete(_token_meta_key(user_id, token))
+
+
+def _is_manual_token(redis_user: redis.Redis, user_id: str, token: str) -> bool:
+    return bool(_load_token_meta(redis_user, user_id, token).get("is_manual"))
 
 def get_current_user_id(authorization: str = Header(None)) -> str:
     """
@@ -402,8 +442,11 @@ def register_user_apis(
             if token_value_raw:
                 token_value = token_value_raw.decode('utf-8')
                 if token_value == device_name:
-                    # 如果找到匹配的 access token，直接返回
-                    existing_token = token_key.decode('utf-8').split(":")[-1]
+                    candidate_token = token_key.decode('utf-8').split(":")[-1]
+                    # 手动创建的 token 不参与登录复用：device_name 仅作展示用
+                    if _is_manual_token(r_user, user_id, candidate_token):
+                        continue
+                    existing_token = candidate_token
                     # 刷新 access token 的有效期
                     r_user.expire(token_key, 30 * 24 * 60 * 60)  # 设置有效期为 30 天
 
@@ -429,9 +472,10 @@ def register_user_apis(
         if not authed:
             raise HTTPException(status_code=403, detail="Invalid access token")
 
-        #更新 access token 的有效期
+        # 手动 token 不做活动续期，按其原始 TTL 自然过期
         token_key = f"access_token:{user_id}:{access_token}"
-        r_user.expire(token_key, 30 * 24 * 60 * 60)  # 设置有效期为 30 天
+        if not _is_manual_token(r_user, user_id, access_token):
+            r_user.expire(token_key, 30 * 24 * 60 * 60)  # 普通 token 有效期重置为 30 天
 
         # 获取用户信息
         key = f"user:{user_id}"
@@ -472,20 +516,90 @@ def register_user_apis(
             val_raw = r_user.get(token_key)
             device_name = val_raw.decode("utf-8") if val_raw else ""
             ttl = r_user.ttl(token_key)
-            if ttl is None or ttl < 0:
+            if ttl is None:
                 ttl_sec = 0
+            elif ttl == -1:
+                ttl_sec = -1  # 显式："永不过期"（手动 token 走 PERSIST 路径）
+            elif ttl < 0:
+                ttl_sec = 0  # -2: key 不存在 / 已过期
             else:
                 ttl_sec = int(ttl)
+            meta = _load_token_meta(r_user, user_id, sess_token)
             sessions.append(
                 {
                     "access_token": sess_token,
                     "device_name": device_name or "未知设备",
                     "expires_in_seconds": ttl_sec,
                     "is_current": sess_token == bearer,
+                    "is_manual": bool(meta.get("is_manual")),
+                    "created_at": meta.get("created_at"),
                 }
             )
         sessions.sort(key=lambda s: (not s["is_current"], s["device_name"] or ""))
         return {"sessions": sessions}
+
+    @app.post("/api/manual_token")
+    async def create_manual_token(payload: dict, authorization: str = Header(None)):
+        """
+        手动签发一个 access token，用于脚本/CI 等需要长期或自定义 TTL 的场景。
+
+        鉴权：Authorization: Bearer <调用方当前 token>。新 token 归属同一 user_id。
+
+        请求体：
+          - device_name (str, 必填)：展示用名称，与登录路径的 device_name 同字段
+          - ttl_seconds (int | None)：自定义有效期；缺省/小于等于 0 视为 None=永不过期
+
+        返回：access_token（**只在此处返回一次**，请妥善保存）、device_name、
+              expires_in_seconds（永不过期为 -1）、is_manual=True、created_at。
+        """
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Authorization header is required")
+        bearer = authorization[7:].strip()
+        if not bearer:
+            raise HTTPException(status_code=401, detail="Invalid authorization token")
+        r_user = app.state.redis_user
+        user_id = get_user_id_from_token(bearer, r_user)
+        if not user_id:
+            raise HTTPException(status_code=403, detail="Invalid access token")
+
+        device_name = (payload.get("device_name") or "").strip()
+        if not device_name:
+            raise HTTPException(status_code=400, detail="device_name is required")
+
+        ttl_raw = payload.get("ttl_seconds")
+        if ttl_raw is None or (isinstance(ttl_raw, (int, float)) and ttl_raw <= 0):
+            ttl_seconds: Optional[int] = None  # 永不过期
+        else:
+            try:
+                ttl_seconds = int(ttl_raw)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="ttl_seconds must be an integer")
+            if ttl_seconds <= 0:
+                ttl_seconds = None
+
+        new_token = uuid.uuid4().hex
+        token_key = f"access_token:{user_id}:{new_token}"
+        if ttl_seconds is None:
+            r_user.set(token_key, device_name.encode("utf-8"))
+        else:
+            r_user.set(token_key, device_name.encode("utf-8"), ex=ttl_seconds)
+
+        created_at = int(time.time())
+        _save_token_meta(
+            r_user,
+            user_id,
+            new_token,
+            {"is_manual": True, "created_at": created_at},
+            ttl_seconds,
+        )
+
+        return {
+            "access_token": new_token,
+            "device_name": device_name,
+            "expires_in_seconds": -1 if ttl_seconds is None else ttl_seconds,
+            "is_manual": True,
+            "created_at": created_at,
+        }
 
     @app.post("/api/logout")
     async def logout(logout_request: dict):
@@ -507,13 +621,14 @@ def register_user_apis(
         if not authed:
             raise HTTPException(status_code=403, detail="Invalid access token")
 
-        # 删除对应的 access token
+        # 删除对应的 access token 与其 meta
         token_key = f"access_token:{user_id}:{access_token}"
         if r_user.exists(token_key):
             r_user.delete(token_key)
+            _delete_token_meta(r_user, user_id, access_token)
             print(f"User {user_id} logged out from device {device_name}.")
             return {"message": "Logged out successfully"}
-        
+
         raise HTTPException(status_code=404, detail="Access token not found")
 
     @app.post("/api/logout_all_devices")
@@ -536,10 +651,13 @@ def register_user_apis(
         if not authed:
             raise HTTPException(status_code=403, detail="Invalid access token")
 
-        # 删除所有 access token
+        # 删除所有 access token 与其 meta
         all_tokens_records = r_user.keys(f"access_token:{user_id}:*")
         for token_key in all_tokens_records:
             r_user.delete(token_key)
+        all_meta_records = r_user.keys(f"access_token_meta:{user_id}:*")
+        for meta_key in all_meta_records:
+            r_user.delete(meta_key)
 
         print(f"User {user_id} logged out all devices (from device {device_name}).")
 
