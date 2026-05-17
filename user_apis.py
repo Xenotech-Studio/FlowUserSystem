@@ -36,6 +36,7 @@ try:
 except ImportError:
     USER_SYSTEM_COS_BUCKET = _DEFAULT_USER_SYSTEM_COS_BUCKET
 from .hooks import UserHooks
+from .srp_apis import register_srp_apis
 
 # Redis 默认连接配置（可被 init_user_redis 参数覆盖）
 REDIS_HOST = "127.0.0.1"
@@ -109,6 +110,38 @@ def _delete_token_meta(redis_user: redis.Redis, user_id: str, token: str) -> Non
 
 def _is_manual_token(redis_user: redis.Redis, user_id: str, token: str) -> bool:
     return bool(_load_token_meta(redis_user, user_id, token).get("is_manual"))
+
+
+def issue_or_reuse_access_token(redis_user: redis.Redis, user_id: str, device_name: str) -> str:
+    """登录成功后发 access token。优先复用同 device_name 的现有 token（手动 token 除外）；
+    没有就新建 30 天 TTL 的 token。
+
+    抽出来给 /api/login 与 /api/srp/login/proof 共用，行为必须一致。
+    """
+    existing_token: Optional[str] = None
+    for token_key in redis_user.keys(f"access_token:{user_id}:*"):
+        token_value_raw = redis_user.get(token_key)
+        if not token_value_raw:
+            continue
+        if token_value_raw.decode("utf-8") != device_name:
+            continue
+        candidate = token_key.decode("utf-8").split(":")[-1]
+        if _is_manual_token(redis_user, user_id, candidate):
+            continue
+        existing_token = candidate
+        redis_user.expire(token_key, 30 * 24 * 60 * 60)
+        break
+
+    if existing_token:
+        return existing_token
+
+    new_token = uuid.uuid4().hex
+    redis_user.set(
+        f"access_token:{user_id}:{new_token}",
+        device_name.encode("utf-8"),
+        ex=30 * 24 * 60 * 60,
+    )
+    return new_token
 
 def get_current_user_id(authorization: str = Header(None)) -> str:
     """
@@ -431,34 +464,8 @@ def register_user_apis(
         if "password" in user and user["password"] != password:
             raise HTTPException(status_code=400, detail="Incorrect password")
 
-        # 获取 Device Name (尽量确保 Device Name 独特)
         device_name = login_request.get("device_name", "Unknown Device")
-
-        # 检查是否有 access token 对应该设备
-        existing_token = None
-        all_tokens_records = r_user.keys(f"access_token:{user_id}:*")
-        for token_key in all_tokens_records:
-            token_value_raw = r_user.get(token_key)
-            if token_value_raw:
-                token_value = token_value_raw.decode('utf-8')
-                if token_value == device_name:
-                    candidate_token = token_key.decode('utf-8').split(":")[-1]
-                    # 手动创建的 token 不参与登录复用：device_name 仅作展示用
-                    if _is_manual_token(r_user, user_id, candidate_token):
-                        continue
-                    existing_token = candidate_token
-                    # 刷新 access token 的有效期
-                    r_user.expire(token_key, 30 * 24 * 60 * 60)  # 设置有效期为 30 天
-
-        # 如果没有找到匹配的 access token，则创建一个新的
-        if not existing_token:
-            # 创建 access token 用 uuid
-            new_access_token = uuid.uuid4().hex
-            new_access_token_key = f"access_token:{user_id}:{new_access_token}"
-            # 设置 access token 有效期为 30 天
-            r_user.set(new_access_token_key, device_name.encode('utf-8'), ex=30 * 24 * 60 * 60)
-            existing_token = new_access_token
-
+        existing_token = issue_or_reuse_access_token(r_user, user_id, device_name)
         return {"message": "Login successful", "user": user, "access_token": existing_token}
 
     @app.get("/api/validate_login")
@@ -717,6 +724,15 @@ def register_user_apis(
                         "message": f"Failed to upload avatar: {str(e)}"
                     }
                 )
+
+    # 挂上 SRP 路由（/api/srp/...）。与旧的 /api/login 等明文路径并存，
+    # 由前端 SDK 选择走哪条；待迁移完成后再删除明文路径。
+    register_srp_apis(
+        app,
+        get_user_redis=get_user_redis,
+        get_user_id_from_token=get_user_id_from_token,
+        issue_access_token=issue_or_reuse_access_token,
+    )
 
     # 返回依赖函数供外部使用
     return get_current_user_id_dep
