@@ -45,7 +45,19 @@ REDIS_USER_DB = 7  # 用户系统 Redis 数据库编号
 
 # 用户信息字段配置
 visitor_userinfo_keys = ["id", "nickname", "avatarUrl"]
-self_userinfo_keys_mask = ["password"]
+# 自己访问自己信息时也要藏起来的字段。
+# - password: 明文密码（migrate strip 后理论上不存在，留着兜底）
+# - srp_verifier: SRP 核心秘密；前端 KDK 派生 + login 验证用不到，给出去只会
+#   给 offline crack 添帮手
+# - password_envelope: boss-recovery 后门，与用户日常无关
+# - k_user_envelope / k_user_recovery_blob: 也是 recovery-only，前端无需取
+self_userinfo_keys_mask = [
+    "password",
+    "srp_verifier",
+    "password_envelope",
+    "k_user_envelope",
+    "k_user_recovery_blob",
+]
 
 # -------------------- 工具函数 --------------------
 

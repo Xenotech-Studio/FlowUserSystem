@@ -51,11 +51,27 @@ def set_srp_credentials(
     salt_hex: str,
     verifier_hex: str,
     envelope_b64: str,
+    *,
+    k_user_blob: Optional[str] = None,
+    k_user_envelope: Optional[str] = None,
+    k_user_recovery_blob: Optional[str] = None,
 ) -> None:
     """把 SRP 凭据写入 user:{user_id}。
     调用方负责自身鉴权（已经验证用户身份后才调用）。
 
     顺手把老的 password 字段抹掉，避免明文残留与 SRP 字段并存。
+
+    k_user_blob: 用户主密钥 K_user 用 KDK (argon2id(password, salt)) 经 AES-GCM 包好
+                 的 base64 字符串。Phase 1 起客户端在注册 / 改密时上传；改密时
+                 客户端用 KDK_new 重封后整体替换。**该字段服务端从不解密**。
+    k_user_envelope: K_user 用 steven.pub 包的 RSA-OAEP envelope，base64。
+                     用于 Tier 3 隔离设备手工恢复；服务端只存不解。
+    k_user_recovery_blob: K_user 用 recovery_secret (邮件给到用户) 包的 AES-GCM
+                          blob, base64。仅当注册 / 改密时用户主动勾选 opt-in
+                          recovery key 才会有；服务端只存不解。
+
+    三个 K_user 相关字段都是 additive — 不传就保持原值不变；显式传空字符串视为不变；
+    如需删除请另用 helper（暂未提供）。
     """
     key = f"user:{user_id}"
     raw = r_user.get(key)
@@ -65,6 +81,12 @@ def set_srp_credentials(
     user["srp_salt"] = salt_hex
     user["srp_verifier"] = verifier_hex
     user["password_envelope"] = envelope_b64
+    if k_user_blob:
+        user["k_user_blob"] = k_user_blob
+    if k_user_envelope:
+        user["k_user_envelope"] = k_user_envelope
+    if k_user_recovery_blob:
+        user["k_user_recovery_blob"] = k_user_recovery_blob
     user.pop("password", None)
     r_user.set(key, json.dumps(user).encode("utf-8"))
 
@@ -176,15 +198,26 @@ def register_srp_apis(
 
         access_token = issue_access_token(r_user, user_id, device_name)
         # user 出参不暴露 SRP 内部字段（verifier 是核心秘密；envelope 是 boss 后门）
+        # 也不暴露 k_user_envelope / k_user_recovery_blob（一个走 Tier 3 一个走 Tier 2，
+        # 客户端 KDK 路径上都不需要）；只露 k_user_blob 让客户端用 KDK 解出 K_user。
         public_user = {
             k: v for k, v in user.items()
-            if k not in ("srp_verifier", "password_envelope", "password")
+            if k not in (
+                "srp_verifier",
+                "password_envelope",
+                "password",
+                "k_user_envelope",
+                "k_user_recovery_blob",
+            )
         }
         return {
             "message": "Login successful",
             "M2": M2_hex,
             "access_token": access_token,
             "user": public_user,
+            # 显式镜像一份方便客户端取（嵌在 user 里也可，但顶层更显眼）；
+            # 不存在 = Phase 1 客户端按 "本机暂无加密能力" 处理 + 引导走"启用加密"流程上传一份
+            "k_user_blob": user.get("k_user_blob"),
         }
 
     @app.post("/api/srp/change_password")
@@ -202,6 +235,14 @@ def register_srp_apis(
         new_envelope = (payload.get("envelope") or "").strip()
         if not new_salt or not new_verifier or not new_envelope:
             raise HTTPException(status_code=400, detail="salt / verifier / envelope are required")
+
+        # K_user wrap 用新 KDK 重封后整体替换（可选 — 没有 K_user 体系的客户端不传）。
+        # k_user_recovery_blob 也跟着更新（如果用户在改密弹窗里勾选了"生成 recovery key"）。
+        # k_user_envelope（boss-pub 包的）原则上 K_user 本身不变就不用动；但客户端如果
+        # 顺手重传也接受。
+        new_k_user_blob = (payload.get("k_user_blob") or "").strip() or None
+        new_k_user_envelope = (payload.get("k_user_envelope") or "").strip() or None
+        new_k_user_recovery_blob = (payload.get("k_user_recovery_blob") or "").strip() or None
 
         super_command = payload.get("super_command")
         if super_command != "just do it":
@@ -237,8 +278,66 @@ def register_srp_apis(
             if not ok:
                 raise HTTPException(status_code=400, detail="Old password is incorrect")
 
-        set_srp_credentials(r_user, user_id, new_salt, new_verifier, new_envelope)
+        set_srp_credentials(
+            r_user,
+            user_id,
+            new_salt,
+            new_verifier,
+            new_envelope,
+            k_user_blob=new_k_user_blob,
+            k_user_envelope=new_k_user_envelope,
+            k_user_recovery_blob=new_k_user_recovery_blob,
+        )
         return {"message": "Password changed successfully"}
+
+    @app.post("/api/srp/upload_k_user")
+    async def upload_k_user(payload: dict, authorization: str = Header(None)):
+        """老用户首次 SRP 登录后用 KDK 现场算出 K_user_blob 并上传一次。
+
+        Phase 1 客户端在 SRP 登录成功后若 response 里 k_user_blob 为空，立刻：
+          1. KDK = argon2id(password, salt)
+          2. K_user = random 32 bytes
+          3. K_user_blob = AES-GCM(K_user, KDK)
+          4. （可选）K_user_envelope = RSA-OAEP(K_user, steven.pub)
+          5. （可选）K_user_recovery_blob = AES-GCM(K_user, recovery_secret) + 邮件发 secret
+          6. POST 本端点
+
+        服务端策略：**只接受首次写入**。已有 k_user_blob 的用户重复调用 → 409。
+        想覆盖请走 /api/srp/change_password（带 SRP 旧密码证明）。
+
+        想清空？暂不提供 API（避免误操作丢数据）；运维侧手工删字段。
+        """
+        if not authorization or not authorization.startswith("Bearer "):
+            raise HTTPException(status_code=401, detail="Authorization header is required")
+        bearer = authorization[7:].strip()
+        r_user = get_user_redis(app)
+        user_id = get_user_id_from_token(bearer, r_user)
+        if not user_id:
+            raise HTTPException(status_code=403, detail="Invalid access token")
+
+        k_user_blob = (payload.get("k_user_blob") or "").strip()
+        if not k_user_blob:
+            raise HTTPException(status_code=400, detail="k_user_blob is required")
+        k_user_envelope = (payload.get("k_user_envelope") or "").strip() or None
+        k_user_recovery_blob = (payload.get("k_user_recovery_blob") or "").strip() or None
+
+        key = f"user:{user_id}"
+        raw = r_user.get(key)
+        if not raw:
+            raise HTTPException(status_code=404, detail="User not found")
+        user = json.loads(raw)
+        if user.get("k_user_blob"):
+            raise HTTPException(
+                status_code=409,
+                detail="k_user_blob already set; use /api/srp/change_password to rotate",
+            )
+        user["k_user_blob"] = k_user_blob
+        if k_user_envelope:
+            user["k_user_envelope"] = k_user_envelope
+        if k_user_recovery_blob:
+            user["k_user_recovery_blob"] = k_user_recovery_blob
+        r_user.set(key, json.dumps(user).encode("utf-8"))
+        return {"message": "K_user uploaded", "k_user_blob": k_user_blob}
 
 
 __all__ = ["register_srp_apis", "set_srp_credentials"]
