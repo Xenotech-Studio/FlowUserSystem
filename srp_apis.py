@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 import redis
-from fastapi import FastAPI, Header, HTTPException
+from fastapi import FastAPI, Header, HTTPException, Response
 
 from . import envelope, srp_helper
 
@@ -98,6 +98,7 @@ def register_srp_apis(
     get_user_id_from_token: Callable[[str, redis.Redis], Optional[str]],
     issue_access_token: Callable[[redis.Redis, str, str], str],
     pubkey_path_resolver: Optional[Callable[[], Path]] = None,
+    set_sso_cookie: Optional[Callable[[Response, str], None]] = None,
 ) -> None:
     """挂上 SRP 路由。
 
@@ -107,6 +108,9 @@ def register_srp_apis(
       issue_access_token(r, user_id, device_name) -> access_token
         登录成功后用于发 token；复用 user_apis 的设备名复用 / TTL 策略。
       pubkey_path_resolver: 仅用于覆盖 /api/srp/pubkey 暴露的密钥文件路径（测试用）。
+      set_sso_cookie(response, token): 可选；成功登录后写入跨域 SSO Cookie，
+        以便 .xenotech.studio 下各子域共享登录态。不传则不写 Cookie（仅返回
+        access_token 给客户端）。
     """
 
     def _resolve_pubkey() -> Path:
@@ -162,7 +166,7 @@ def register_srp_apis(
         return {"session_id": session_id, "salt": salt_hex, "B": B_hex}
 
     @app.post("/api/srp/login/proof")
-    async def srp_login_proof(payload: dict):
+    async def srp_login_proof(payload: dict, response: Response):
         session_id = (payload.get("session_id") or "").strip()
         A_hex = (payload.get("A") or "").strip()
         M1 = (payload.get("M1") or "").strip()
@@ -197,6 +201,8 @@ def register_srp_apis(
         user = json.loads(user_raw)
 
         access_token = issue_access_token(r_user, user_id, device_name)
+        if set_sso_cookie is not None:
+            set_sso_cookie(response, access_token)
         # user 出参不暴露 SRP 内部字段（verifier 是核心秘密；envelope 是 boss 后门）
         # 也不暴露 k_user_envelope / k_user_recovery_blob（一个走 Tier 3 一个走 Tier 2，
         # 客户端 KDK 路径上都不需要）；只露 k_user_blob 让客户端用 KDK 解出 K_user。

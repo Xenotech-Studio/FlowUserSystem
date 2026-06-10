@@ -9,7 +9,7 @@ User APIs
 - 头像上传
 """
 
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends, Cookie, Response
 from fastapi.responses import JSONResponse
 from typing import Any, Callable, Optional
 import json
@@ -58,6 +58,34 @@ self_userinfo_keys_mask = [
     "k_user_envelope",
     "k_user_recovery_blob",
 ]
+
+# -------------------- 跨域 SSO Cookie 配置 --------------------
+# 同账号在 .xenotech.studio 各子域（e-store-00 ~ e-store-08）共享登录态。
+# 与 Authorization: Bearer header 并存，header 优先；浏览器以外的客户端继续走 header。
+SSO_COOKIE_NAME = "estore_access_token"
+SSO_COOKIE_DOMAIN = ".xenotech.studio"
+SSO_COOKIE_MAX_AGE = 30 * 24 * 60 * 60  # 与 access token TTL 对齐
+
+
+def _set_sso_cookie(response: Response, token: str) -> None:
+    response.set_cookie(
+        key=SSO_COOKIE_NAME,
+        value=token,
+        domain=SSO_COOKIE_DOMAIN,
+        path="/",
+        samesite="lax",
+        secure=True,
+        httponly=True,
+        max_age=SSO_COOKIE_MAX_AGE,
+    )
+
+
+def _clear_sso_cookie(response: Response) -> None:
+    response.delete_cookie(
+        key=SSO_COOKIE_NAME,
+        domain=SSO_COOKIE_DOMAIN,
+        path="/",
+    )
 
 # -------------------- 工具函数 --------------------
 
@@ -178,25 +206,35 @@ def create_get_current_user_id_dependency(app: FastAPI):
         async def some_endpoint(user_id: str = Depends(get_current_user_id)):
             ...
     """
-    def _get_current_user_id(authorization: str = Header(None)) -> str:
-        """从请求头获取当前用户ID"""
-        if not authorization:
-            raise HTTPException(status_code=401, detail="Authorization header is required")
-        
-        # 提取Bearer token
-        if not authorization.startswith("Bearer "):
-            raise HTTPException(status_code=401, detail="Invalid authorization format")
-        
-        token = authorization[7:]  # 移除 "Bearer " 前缀
-        
+    def _get_current_user_id(
+        authorization: str = Header(None),
+        estore_access_token: Optional[str] = Cookie(None),
+    ) -> str:
+        """获取当前用户ID。
+
+        优先使用 Authorization: Bearer header；若缺失则回退到跨域 SSO
+        Cookie（.xenotech.studio 域下的 estore_access_token），用于在
+        e-store-00 ~ e-store-08 子域之间共享登录态。
+        """
+        token: Optional[str] = None
+        if authorization:
+            if not authorization.startswith("Bearer "):
+                raise HTTPException(status_code=401, detail="Invalid authorization format")
+            token = authorization[7:]  # 移除 "Bearer " 前缀
+        elif estore_access_token:
+            token = estore_access_token
+
+        if not token:
+            raise HTTPException(status_code=401, detail="Authorization header or SSO cookie is required")
+
         # 从token获取user_id
         r_user = get_user_redis(app)
         user_id = get_user_id_from_token(token, r_user)
         if not user_id:
             raise HTTPException(status_code=403, detail="Invalid access token")
-        
+
         return user_id
-    
+
     return _get_current_user_id
 
 # -------------------- 数据库初始化 --------------------
@@ -456,7 +494,7 @@ def register_user_apis(
         return {"message": "Password changed successfully", "user": user_hidding_password}
 
     @app.post("/api/login")
-    async def login(login_request: dict):
+    async def login(login_request: dict, response: Response):
         """User login"""
         r_user = app.state.redis_user
         user_id = login_request.get("id")
@@ -465,19 +503,20 @@ def register_user_apis(
         key = f"user:{user_id}"
         if not r_user.exists(key):
             raise HTTPException(status_code=404, detail="User not found")
-        
+
         user_raw = r_user.get(key)
         user = json.loads(user_raw)
         password = login_request.get("password")
         if not password:
             raise HTTPException(status_code=400, detail="Password is required")
-        
+
         # 验证密码
         if "password" in user and user["password"] != password:
             raise HTTPException(status_code=400, detail="Incorrect password")
 
         device_name = login_request.get("device_name", "Unknown Device")
         existing_token = issue_or_reuse_access_token(r_user, user_id, device_name)
+        _set_sso_cookie(response, existing_token)
         return {"message": "Login successful", "user": user, "access_token": existing_token}
 
     @app.get("/api/validate_login")
@@ -621,7 +660,7 @@ def register_user_apis(
         }
 
     @app.post("/api/logout")
-    async def logout(logout_request: dict):
+    async def logout(logout_request: dict, response: Response):
         """Logout user from a specific device"""
         r_user = app.state.redis_user
         user_id = logout_request.get("id")
@@ -645,6 +684,7 @@ def register_user_apis(
         if r_user.exists(token_key):
             r_user.delete(token_key)
             _delete_token_meta(r_user, user_id, access_token)
+            _clear_sso_cookie(response)
             print(f"User {user_id} logged out from device {device_name}.")
             return {"message": "Logged out successfully"}
 
@@ -744,6 +784,7 @@ def register_user_apis(
         get_user_redis=get_user_redis,
         get_user_id_from_token=get_user_id_from_token,
         issue_access_token=issue_or_reuse_access_token,
+        set_sso_cookie=_set_sso_cookie,
     )
 
     # 返回依赖函数供外部使用
