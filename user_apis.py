@@ -173,8 +173,12 @@ def issue_or_reuse_access_token(redis_user: redis.Redis, user_id: str, device_na
         break
 
     if existing_token:
-        # 刷新反向查找映射的 TTL
-        redis_user.expire(f"access_token_lookup:{existing_token}", 30 * 24 * 60 * 60)
+        lookup_key = f"access_token_lookup:{existing_token}"
+        # 兼容老 token：若 lookup key 不存在则补建（迁移逻辑）
+        if not redis_user.exists(lookup_key):
+            redis_user.set(lookup_key, user_id, ex=30 * 24 * 60 * 60)
+        else:
+            redis_user.expire(lookup_key, 30 * 24 * 60 * 60)
         return existing_token
 
     new_token = uuid.uuid4().hex
