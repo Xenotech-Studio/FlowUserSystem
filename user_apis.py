@@ -173,6 +173,8 @@ def issue_or_reuse_access_token(redis_user: redis.Redis, user_id: str, device_na
         break
 
     if existing_token:
+        # 刷新反向查找映射的 TTL
+        redis_user.expire(f"access_token_lookup:{existing_token}", 30 * 24 * 60 * 60)
         return existing_token
 
     new_token = uuid.uuid4().hex
@@ -181,6 +183,8 @@ def issue_or_reuse_access_token(redis_user: redis.Redis, user_id: str, device_na
         device_name.encode("utf-8"),
         ex=30 * 24 * 60 * 60,
     )
+    # 存储反向映射：access_token -> user_id，用于从 Cookie 恢复身份
+    redis_user.set(f"access_token_lookup:{new_token}", user_id, ex=30 * 24 * 60 * 60)
     return new_token
 
 def get_current_user_id(authorization: str = Header(None)) -> str:
@@ -519,23 +523,34 @@ def register_user_apis(
         _set_sso_cookie(response, existing_token)
         return {"message": "Login successful", "user": user, "access_token": existing_token}
 
-    @app.get("/api/validate_login")
-    async def validate_login(user_id: str, access_token: str):
-        """Validate user login with access token"""
-        r_user = app.state.redis_user
-        if not user_id or not access_token:
-            raise HTTPException(status_code=400, detail="User ID and access token are required")
+    @app.post("/api/validate_login")
+    async def validate_login(response: Response, estore_access_token: str = Cookie(None)):
+        """Validate user login with cookie token (SSO)"""
+        if not estore_access_token:
+            raise HTTPException(status_code=401, detail="No access token cookie found")
         
-        authed, device_name = check_access_token(access_token, user_id, r_user)
+        r_user = app.state.redis_user
+        
+        # 1. 从 Cookie Token 反查 User ID
+        user_id = r_user.get(f"access_token_lookup:{estore_access_token}")
+        if not user_id:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        
+        user_id = user_id.decode("utf-8")
+        
+        # 2. 验证 Token 是否仍然有效 (check_access_token returns (bool, device_name))
+        # 注意：check_access_token 签名是 (token, user_id, redis)
+        authed, device_name = check_access_token(estore_access_token, user_id, r_user)
         if not authed:
-            raise HTTPException(status_code=403, detail="Invalid access token")
+            raise HTTPException(status_code=403, detail="Token validation failed")
 
-        # 手动 token 不做活动续期，按其原始 TTL 自然过期
-        token_key = f"access_token:{user_id}:{access_token}"
-        if not _is_manual_token(r_user, user_id, access_token):
-            r_user.expire(token_key, 30 * 24 * 60 * 60)  # 普通 token 有效期重置为 30 天
+        # 3. 刷新 Token 有效期 (续期)
+        token_key = f"access_token:{user_id}:{estore_access_token}"
+        if not _is_manual_token(r_user, user_id, estore_access_token):
+            r_user.expire(token_key, 30 * 24 * 60 * 60)
+            r_user.expire(f"access_token_lookup:{estore_access_token}", 30 * 24 * 60 * 60)
 
-        # 获取用户信息
+        # 4. 获取用户信息
         key = f"user:{user_id}"
         if not r_user.exists(key):
             raise HTTPException(status_code=404, detail="User not found")
