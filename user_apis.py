@@ -9,7 +9,7 @@ User APIs
 - 头像上传
 """
 
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends, Cookie, Response
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends, Cookie, Response, Body
 from fastapi.responses import JSONResponse
 from typing import Any, Callable, Optional
 import json
@@ -679,10 +679,26 @@ def register_user_apis(
         }
 
     @app.post("/api/logout")
-    async def logout(logout_request: dict, response: Response):
+    async def logout(
+        response: Response,
+        logout_request: Optional[dict] = Body(default=None),
+        authorization: str = Header(None),
+        estore_access_token: Optional[str] = Cookie(None),
+    ):
         """Logout user from a specific device"""
         r_user = app.state.redis_user
-        user_id = logout_request.get("id")
+        logout_request = logout_request or {}
+
+        # access token：优先 body，其次 Bearer header，最后 SSO cookie
+        access_token = logout_request.get("access_token")
+        if not access_token and authorization and authorization.startswith("Bearer "):
+            access_token = authorization[7:].strip()
+        if not access_token and estore_access_token:
+            access_token = estore_access_token
+        if not access_token:
+            raise HTTPException(status_code=400, detail="Access token is required")
+
+        user_id = logout_request.get("id") or get_user_id_from_token(access_token, r_user)
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID is required")
         key = f"user:{user_id}"
@@ -690,9 +706,6 @@ def register_user_apis(
             raise HTTPException(status_code=404, detail="User not found")
 
         # 检查权限
-        access_token = logout_request.get("access_token")
-        if not access_token:
-            raise HTTPException(status_code=400, detail="Access token is required")
         authed, device_name = check_access_token(access_token, user_id, r_user)
 
         if not authed:
