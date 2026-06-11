@@ -762,31 +762,26 @@ def register_user_apis(
         @app.post("/api/upload_avatar")
         async def upload_avatar_api(
             file: UploadFile = File(...),
-            authorization: str = Header(None)
+            user_id: str = Depends(get_current_user_id_dep),
         ):
             """
             上传用户头像到腾讯云 COS。bucket 优先 register_user_apis 的 avatar_bucket
             参数；其次模块级 USER_SYSTEM_COS_BUCKET（来自宿主 config.py 或默认值）。
             上传函数为 register_user_apis 注入的 file_to_url（推荐 flow_upload.file_to_url）。
             前端已处理图片格式转换和文件重命名。
-            
+
+            身份验证走 get_current_user_id_dep（Depends 注入）：优先
+            Authorization: Bearer header，缺失时回退跨子域 SSO Cookie
+            （estore_access_token）。此前手动调用该依赖只传了 header，
+            导致仅持 SSO Cookie 登录态的用户（如平台管理员）上传头像 401。
+
             参数:
               file: 要上传的头像文件（前端已转换为PNG格式并以用户ID命名）
-              authorization: Bearer token，用于身份验证
-            
+
             返回:
               上传后的文件 URL
             """
             try:
-                # 验证用户身份
-                if not authorization:
-                    raise HTTPException(status_code=401, detail="Authorization header is required")
-                
-                r_user = app.state.redis_user
-                user_id = get_current_user_id_dep(authorization)
-                if not user_id:
-                    raise HTTPException(status_code=403, detail="Invalid access token")
-                
                 # 直接使用前端传来的文件（已重命名为用户ID）
                 file_url = _avatar_file_to_url(
                     file, folder_name=avatar_folder, bucket=_avatar_bucket
