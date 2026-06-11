@@ -519,13 +519,23 @@ def register_user_apis(
             raise HTTPException(status_code=400, detail="Password is required")
 
         # 验证密码
-        if "password" in user and user["password"] != password:
-            raise HTTPException(status_code=400, detail="Incorrect password")
+        if user.get("password"):
+            if user["password"] != password:
+                raise HTTPException(status_code=400, detail="Incorrect password")
+        elif user.get("srp_verifier"):
+            # SRP-only 账号（注册即 SRP / 已 strip 明文）：明文路径无法校验，
+            # 必须拒绝——否则没有 password 字段时任意密码都能登录。
+            # 409 与 /api/srp/login/challenge 对未迁移用户的语义互为镜像。
+            raise HTTPException(
+                status_code=409,
+                detail="Account uses SRP login; use /api/srp/login/challenge",
+            )
 
         device_name = login_request.get("device_name", "Unknown Device")
         existing_token = issue_or_reuse_access_token(r_user, user_id, device_name)
         _set_sso_cookie(response, existing_token)
-        return {"message": "Login successful", "user": user, "access_token": existing_token}
+        public_user = {k: v for k, v in user.items() if k not in self_userinfo_keys_mask}
+        return {"message": "Login successful", "user": public_user, "access_token": existing_token}
 
     @app.post("/api/validate_login")
     async def validate_login(response: Response, estore_access_token: str = Cookie(None)):
