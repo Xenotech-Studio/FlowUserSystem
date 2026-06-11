@@ -24,7 +24,7 @@ import sys
 
 import redis
 
-from . import envelope, srp_helper
+from .srp_apis import generate_srp_credentials
 
 
 def _load_redis(host: str, port: int, db: int) -> redis.Redis:
@@ -72,24 +72,20 @@ def migrate(
 
         plaintext = user["password"]
         try:
-            salt = srp_helper.generate_salt_hex()
-            srp_pw = srp_helper.derive_srp_password(plaintext, salt)
-            verifier = srp_helper.compute_verifier(user_id, srp_pw, salt)
-            envel = envelope.encrypt_envelope(plaintext)
+            creds = generate_srp_credentials(user_id, plaintext)
         except Exception as e:
             print(f"  [ERR] {user_id}: derive failed ({e})", file=sys.stderr)
             stats["errors"] += 1
             continue
 
-        user["srp_salt"] = salt
-        user["srp_verifier"] = verifier
-        user["password_envelope"] = envel
+        user.update(creds)
         if strip_plaintext:
             user.pop("password", None)
 
         if dry_run:
             print(f"  [DRY] {user_id}: would migrate "
-                  f"(salt={salt[:8]}..., verifier_len={len(verifier)}, env_len={len(envel)})")
+                  f"(salt={creds['srp_salt'][:8]}..., verifier_len={len(creds['srp_verifier'])},"
+                  f" env_len={len(creds['password_envelope'])})")
         else:
             r.set(key, json.dumps(user).encode("utf-8"))
             print(f"  [OK]  {user_id}: migrated"

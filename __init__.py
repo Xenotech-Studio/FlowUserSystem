@@ -16,7 +16,7 @@ from .user_apis import (
 )
 from .hooks import UserHooks
 from .cos_upload import file_to_url, bytes_to_cos_url, multipart_upload_from_chunk_queue
-from .srp_apis import set_srp_credentials, register_srp_apis
+from .srp_apis import generate_srp_credentials, set_srp_credentials, register_srp_apis
 from . import srp_helper, envelope
 
 __all__ = [
@@ -34,6 +34,7 @@ __all__ = [
     "visitor_userinfo_keys",
     "self_userinfo_keys_mask",
     # SRP / envelope
+    "generate_srp_credentials",
     "set_srp_credentials",
     "register_srp_apis",
     "srp_helper",

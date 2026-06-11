@@ -45,6 +45,26 @@ def _challenge_key(session_id: str) -> str:
     return f"srp_challenge:{session_id}"
 
 
+def generate_srp_credentials(user_id: str, plaintext: str) -> dict:
+    """服务端代客户端生成一套 SRP 凭据字段（注册 / 迁移用）。
+
+    返回 {"srp_salt", "srp_verifier", "password_envelope"}，可直接 update 进
+    user:{user_id} 记录。与前端注册流程产出完全等价（同 argon2 参数、同 salt
+    复用约定），因此该用户之后可以直接走 /api/srp/login/* 登录。
+
+    注意：调用方临时持有明文（如管理员代建账号）；记录里不要落 password 字段。
+    """
+    salt_hex = srp_helper.generate_salt_hex()
+    srp_password = srp_helper.derive_srp_password(plaintext, salt_hex)
+    verifier_hex = srp_helper.compute_verifier(user_id, srp_password, salt_hex)
+    envelope_b64 = envelope.encrypt_envelope(plaintext)
+    return {
+        "srp_salt": salt_hex,
+        "srp_verifier": verifier_hex,
+        "password_envelope": envelope_b64,
+    }
+
+
 def set_srp_credentials(
     r_user: redis.Redis,
     user_id: str,
@@ -346,4 +366,4 @@ def register_srp_apis(
         return {"message": "K_user uploaded", "k_user_blob": k_user_blob}
 
 
-__all__ = ["register_srp_apis", "set_srp_credentials"]
+__all__ = ["generate_srp_credentials", "register_srp_apis", "set_srp_credentials"]
