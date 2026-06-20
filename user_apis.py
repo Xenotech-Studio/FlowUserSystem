@@ -90,8 +90,25 @@ def _clear_sso_cookie(response: Response) -> None:
 # -------------------- 工具函数 --------------------
 
 def get_user_id_from_token(token: str, redis_user: redis.Redis) -> Optional[str]:
-    """从token获取user_id（通过遍历所有access_token键）"""
-    # 遍历所有access_token键，查找匹配的token
+    """从 token 获取 user_id。
+
+    快路径：GET access_token_lookup:{token} 直出 user_id，再 EXISTS access_token:{user_id}:{token} 防伪。
+    慢路径（兜底）：旧 KEYS access_token:* 扫；命中后沿用主 key 剩余 TTL 回填 lookup，下次走快路径。
+    旧路径每次都做全 keyspace KEYS 扫，每个鉴权请求都会触发，是阻塞 Redis 的主要来源。
+    """
+    if not token:
+        return None
+
+    # ---- 快路径 ----
+    lookup_raw = redis_user.get(f"access_token_lookup:{token}")
+    if lookup_raw:
+        user_id = lookup_raw.decode("utf-8") if isinstance(lookup_raw, (bytes, bytearray)) else str(lookup_raw)
+        if redis_user.exists(f"access_token:{user_id}:{token}"):
+            return user_id
+        # 主 key 不在了说明 token 已失效但 lookup 没同步——清掉孤儿避免误判
+        redis_user.delete(f"access_token_lookup:{token}")
+
+    # ---- 兜底慢路径（向后兼容 lookup 加入前签发的老 token） ----
     all_token_keys = redis_user.keys("access_token:*")
     for token_key in all_token_keys:
         key_parts = token_key.decode('utf-8').split(":")
@@ -100,6 +117,12 @@ def get_user_id_from_token(token: str, redis_user: redis.Redis) -> Optional[str]
             user_id = key_parts[1]
             # 验证token是否有效
             if redis_user.exists(token_key):
+                # 回填 lookup，沿用主 key 剩余 TTL（-1=PERSIST，-2=不存在跳过）
+                ttl = redis_user.ttl(token_key)
+                if ttl == -1:
+                    redis_user.set(f"access_token_lookup:{token}", user_id)
+                elif ttl is not None and ttl > 0:
+                    redis_user.set(f"access_token_lookup:{token}", user_id, ex=int(ttl))
                 return user_id
     return None
 
@@ -433,6 +456,7 @@ def register_user_apis(
             msg = "User updated successfully"
         else:
             r_user.set(key, json.dumps(user_data).encode('utf-8'))
+            r_user.sadd("users:index", user_id)
             hooks.call_user_created(user_id, user_data, r_user)
             payload_user = user_data
             msg = "User added successfully"
@@ -461,6 +485,7 @@ def register_user_apis(
             before_user_key_deleted(user_id)
 
         r_user.delete(key)
+        r_user.srem("users:index", user_id)
 
         # 备份已删除用户数据至 deleted_user 表
         deleted_key = f"user_deleted:{user_id}"
@@ -679,6 +704,12 @@ def register_user_apis(
             {"is_manual": True, "created_at": created_at},
             ttl_seconds,
         )
+        # 与主 key 同寿命的 lookup 反向索引，让 get_user_id_from_token 命中快路径
+        lookup_key = f"access_token_lookup:{new_token}"
+        if ttl_seconds is None:
+            r_user.set(lookup_key, user_id)
+        else:
+            r_user.set(lookup_key, user_id, ex=ttl_seconds)
 
         return {
             "access_token": new_token,
@@ -721,11 +752,12 @@ def register_user_apis(
         if not authed:
             raise HTTPException(status_code=403, detail="Invalid access token")
 
-        # 删除对应的 access token 与其 meta
+        # 删除对应的 access token、meta、以及 lookup 反向索引
         token_key = f"access_token:{user_id}:{access_token}"
         if r_user.exists(token_key):
             r_user.delete(token_key)
             _delete_token_meta(r_user, user_id, access_token)
+            r_user.delete(f"access_token_lookup:{access_token}")
             _clear_sso_cookie(response)
             print(f"User {user_id} logged out from device {device_name}.")
             return {"message": "Logged out successfully"}
@@ -752,10 +784,13 @@ def register_user_apis(
         if not authed:
             raise HTTPException(status_code=403, detail="Invalid access token")
 
-        # 删除所有 access token 与其 meta
+        # 删除所有 access token、meta、以及 lookup 反向索引
         all_tokens_records = r_user.keys(f"access_token:{user_id}:*")
         for token_key in all_tokens_records:
+            key_s = token_key.decode("utf-8") if isinstance(token_key, (bytes, bytearray)) else str(token_key)
+            tok = key_s.split(":")[-1]
             r_user.delete(token_key)
+            r_user.delete(f"access_token_lookup:{tok}")
         all_meta_records = r_user.keys(f"access_token_meta:{user_id}:*")
         for meta_key in all_meta_records:
             r_user.delete(meta_key)
