@@ -38,6 +38,70 @@ except ImportError:
 from .hooks import UserHooks
 from .srp_apis import register_srp_apis
 
+# ── SQLite dual-write (Expand 阶段) ──────────────────────────────────────────
+# 所有 Redis user/token 写完之后追加一次 SQLite 写。失败只 warning，绝不抛——
+# Redis 是主路径，SQLite 落地是副。后续 contract 阶段才会反过来。
+import logging as _hs_logging
+try:
+    from database import hybrid_store as _hs
+    _hs_available = True
+except Exception:  # noqa: BLE001 — submodule 在不同部署里可能未挂载
+    _hs = None
+    _hs_available = False
+
+_hs_logger = _hs_logging.getLogger("flops.user.dualwrite")
+
+
+def _hs_dual_save_user(user: dict) -> None:
+    if not _hs_available or _hs is None:
+        return
+    try:
+        _hs.save_user(user)
+    except Exception as e:
+        _hs_logger.warning("dual-write save_user failed uid=%s: %s",
+                           (user.get("id") if isinstance(user, dict) else None), e)
+
+
+def _hs_dual_delete_user(user_id: str) -> None:
+    if not _hs_available or _hs is None:
+        return
+    try:
+        _hs.delete_user(user_id)
+    except Exception as e:
+        _hs_logger.warning("dual-write delete_user failed uid=%s: %s", user_id, e)
+
+
+def _hs_dual_save_token(
+    *, token: str, user_id: str, device_name: Optional[str],
+    is_manual: bool, created_at: float,
+    expires_at: Optional[float] = None,
+) -> None:
+    if not _hs_available or _hs is None:
+        return
+    try:
+        _hs.save_token({
+            "token": token,
+            "user_id": user_id,
+            "device_name": device_name,
+            "is_manual": bool(is_manual),
+            "created_at": float(created_at),
+            "expires_at": expires_at,
+        })
+    except Exception as e:
+        _hs_logger.warning("dual-write save_token failed token=%s uid=%s: %s",
+                           token[:8] + "..." if isinstance(token, str) else token, user_id, e)
+
+
+def _hs_dual_delete_token(token: str) -> None:
+    if not _hs_available or _hs is None:
+        return
+    try:
+        _hs.delete_token(token)
+    except Exception as e:
+        _hs_logger.warning("dual-write delete_token failed token=%s: %s",
+                           token[:8] + "..." if isinstance(token, str) else token, e)
+# ── end dual-write helpers ──────────────────────────────────────────────────
+
 # Redis 默认连接配置（可被 init_user_redis 参数覆盖）
 REDIS_HOST = "127.0.0.1"
 REDIS_PORT = 6379
@@ -202,6 +266,12 @@ def issue_or_reuse_access_token(redis_user: redis.Redis, user_id: str, device_na
             redis_user.set(lookup_key, user_id, ex=30 * 24 * 60 * 60)
         else:
             redis_user.expire(lookup_key, 30 * 24 * 60 * 60)
+        # SQLite dual-write 续期：更新 expires_at，让 SQLite 与 Redis TTL 同步
+        _hs_dual_save_token(
+            token=existing_token, user_id=user_id, device_name=device_name,
+            is_manual=False, created_at=int(time.time()),
+            expires_at=int(time.time()) + 30 * 24 * 60 * 60,
+        )
         return existing_token
 
     new_token = uuid.uuid4().hex
@@ -212,6 +282,12 @@ def issue_or_reuse_access_token(redis_user: redis.Redis, user_id: str, device_na
     )
     # 存储反向映射：access_token -> user_id，用于从 Cookie 恢复身份
     redis_user.set(f"access_token_lookup:{new_token}", user_id, ex=30 * 24 * 60 * 60)
+    # SQLite dual-write of new login token
+    _ts = int(time.time())
+    _hs_dual_save_token(
+        token=new_token, user_id=user_id, device_name=device_name,
+        is_manual=False, created_at=_ts, expires_at=_ts + 30 * 24 * 60 * 60,
+    )
     return new_token
 
 def get_current_user_id(authorization: str = Header(None)) -> str:
@@ -452,12 +528,14 @@ def register_user_apis(
             existing_user.update(user_data)
             r_user.set(key, json.dumps(existing_user).encode('utf-8'))
             hooks.call_user_updated(user_id, existing_user, r_user)
+            _hs_dual_save_user(existing_user)
             payload_user = existing_user
             msg = "User updated successfully"
         else:
             r_user.set(key, json.dumps(user_data).encode('utf-8'))
             r_user.sadd("users:index", user_id)
             hooks.call_user_created(user_id, user_data, r_user)
+            _hs_dual_save_user(user_data)
             payload_user = user_data
             msg = "User added successfully"
         if after_user_saved is not None:
@@ -486,6 +564,7 @@ def register_user_apis(
 
         r_user.delete(key)
         r_user.srem("users:index", user_id)
+        _hs_dual_delete_user(user_id)
 
         # 备份已删除用户数据至 deleted_user 表
         deleted_key = f"user_deleted:{user_id}"
@@ -521,6 +600,7 @@ def register_user_apis(
 
         user["password"] = new_password
         r_user.set(key, json.dumps(user).encode('utf-8'))
+        _hs_dual_save_user(user)
 
         user_hidding_password = user.copy()
         user_hidding_password.pop("password", None)
@@ -711,6 +791,12 @@ def register_user_apis(
         else:
             r_user.set(lookup_key, user_id, ex=ttl_seconds)
 
+        _hs_dual_save_token(
+            token=new_token, user_id=user_id, device_name=device_name,
+            is_manual=True, created_at=created_at,
+            expires_at=(created_at + ttl_seconds) if ttl_seconds else None,
+        )
+
         return {
             "access_token": new_token,
             "device_name": device_name,
@@ -758,6 +844,7 @@ def register_user_apis(
             r_user.delete(token_key)
             _delete_token_meta(r_user, user_id, access_token)
             r_user.delete(f"access_token_lookup:{access_token}")
+            _hs_dual_delete_token(access_token)
             _clear_sso_cookie(response)
             print(f"User {user_id} logged out from device {device_name}.")
             return {"message": "Logged out successfully"}
@@ -791,6 +878,7 @@ def register_user_apis(
             tok = key_s.split(":")[-1]
             r_user.delete(token_key)
             r_user.delete(f"access_token_lookup:{tok}")
+            _hs_dual_delete_token(tok)
         all_meta_records = r_user.keys(f"access_token_meta:{user_id}:*")
         for meta_key in all_meta_records:
             r_user.delete(meta_key)

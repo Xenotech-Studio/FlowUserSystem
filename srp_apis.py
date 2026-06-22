@@ -109,6 +109,18 @@ def set_srp_credentials(
         user["k_user_recovery_blob"] = k_user_recovery_blob
     user.pop("password", None)
     r_user.set(key, json.dumps(user).encode("utf-8"))
+    # SQLite dual-write (best-effort). 复用 user_apis 里已有的 helper
+    # 避免重复造轮子。两个文件互相 import 不会循环：user_apis 仅 import
+    # database.hybrid_store；srp_apis 已经 import user_apis 的别处函数。
+    try:
+        from .user_apis import _hs_dual_save_user as _hs_save_user
+        _hs_save_user(user)
+    except Exception as _e:  # noqa: BLE001
+        import logging as _logging
+        _logging.getLogger("flops.user.dualwrite").warning(
+            "srp set_srp_credentials dual-write failed uid=%s: %s",
+            user.get("id"), _e,
+        )
 
 
 def register_srp_apis(
@@ -363,6 +375,15 @@ def register_srp_apis(
         if k_user_recovery_blob:
             user["k_user_recovery_blob"] = k_user_recovery_blob
         r_user.set(key, json.dumps(user).encode("utf-8"))
+        # SQLite dual-write (best-effort)
+        try:
+            from .user_apis import _hs_dual_save_user as _hs_save_user
+            _hs_save_user(user)
+        except Exception as _e:  # noqa: BLE001
+            import logging as _logging
+            _logging.getLogger("flops.user.dualwrite").warning(
+                "srp upload_k_user dual-write failed uid=%s: %s", user_id, _e,
+            )
         return {"message": "K_user uploaded", "k_user_blob": k_user_blob}
 
 
