@@ -36,7 +36,7 @@ try:
 except ImportError:
     USER_SYSTEM_COS_BUCKET = _DEFAULT_USER_SYSTEM_COS_BUCKET
 from .hooks import UserHooks
-from .srp_apis import register_srp_apis
+from .srp_apis import generate_srp_credentials, register_srp_apis
 
 # ── SQLite dual-write (Expand 阶段) ──────────────────────────────────────────
 # 所有 Redis user/token 写完之后追加一次 SQLite 写。失败只 warning，绝不抛——
@@ -520,12 +520,25 @@ def register_user_apis(
         user_id = user_data.get("id")
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID is required")
+
+        # 带明文 password 时（universal admin「新建 B 类用户」走这条），
+        # 就地派生 SRP 凭据（salt/verifier/envelope）后落库、不再存明文。
+        # 否则记录只有明文 password、缺 SRP 字段，走 /api/srp/login/challenge
+        # 会被 409 "SRP credentials not set" 挡住（zhuoheng / lisa 即因此无法登录）。
+        # 与 create_store_staff / set_srp_credentials 的 SRP-only 语义保持一致。
+        plaintext_pw = user_data.get("password")
+        if plaintext_pw:
+            user_data = {k: v for k, v in user_data.items() if k != "password"}
+            user_data.update(generate_srp_credentials(user_id, plaintext_pw))
+
         key = f"user:{user_id}"
         if r_user.exists(key):
             # 更新用户信息
             existing_user_raw = r_user.get(key)
             existing_user = json.loads(existing_user_raw)
             existing_user.update(user_data)
+            if plaintext_pw:
+                existing_user.pop("password", None)  # 换新 SRP 后清掉历史明文残留
             r_user.set(key, json.dumps(existing_user).encode('utf-8'))
             hooks.call_user_updated(user_id, existing_user, r_user)
             _hs_dual_save_user(existing_user)
@@ -540,7 +553,9 @@ def register_user_apis(
             msg = "User added successfully"
         if after_user_saved is not None:
             after_user_saved(user_id)
-        return {"message": msg, "user": payload_user}
+        # 出参屏蔽 SRP 秘密（verifier/envelope）等敏感字段，勿回传给前端
+        public_user = {k: v for k, v in payload_user.items() if k not in self_userinfo_keys_mask}
+        return {"message": msg, "user": public_user}
 
     @app.post("/api/delete_user")
     async def delete_user(user_data: dict):
