@@ -29,12 +29,15 @@ import json
 import time
 import uuid
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional, TYPE_CHECKING
 
 import redis
 from fastapi import FastAPI, Header, HTTPException, Response
 
 from . import envelope, srp_helper
+
+if TYPE_CHECKING:  # type-only; avoids a runtime import of the kernel package here
+    from flops_agent.session import SessionStore
 
 
 SRP_CHALLENGE_TTL_SEC = 300       # 挑战在 5 分钟内必须完成 proof
@@ -63,6 +66,84 @@ def generate_srp_credentials(user_id: str, plaintext: str) -> dict:
         "srp_verifier": verifier_hex,
         "password_envelope": envelope_b64,
     }
+
+
+def _apply_srp_credentials(
+    user: dict,
+    salt_hex: str,
+    verifier_hex: str,
+    envelope_b64: str,
+    *,
+    k_user_blob: Optional[str] = None,
+    k_user_envelope: Optional[str] = None,
+    k_user_recovery_blob: Optional[str] = None,
+) -> None:
+    """In-place field merge of SRP credentials onto a user record dict.
+
+    Shared by ``set_srp_credentials`` (redis read→apply→write) and the
+    ``change_password`` route (store read→apply→save) so the exact field
+    semantics — additive K_user fields, password strip — stay identical.
+    """
+    user["srp_salt"] = salt_hex
+    user["srp_verifier"] = verifier_hex
+    user["password_envelope"] = envelope_b64
+    if k_user_blob:
+        user["k_user_blob"] = k_user_blob
+    if k_user_envelope:
+        user["k_user_envelope"] = k_user_envelope
+    if k_user_recovery_blob:
+        user["k_user_recovery_blob"] = k_user_recovery_blob
+    user.pop("password", None)
+
+
+class _LegacyCallableStore:
+    """Default ``SessionStore`` built from ``register_srp_apis``'s legacy
+    callable params. Reproduces the exact inline Redis ops the routes used
+    before the seam, so behavior is unchanged when no ``store`` is injected.
+    """
+
+    def __init__(self, app, get_user_redis, get_user_id_from_token, issue_access_token):
+        self._app = app
+        self._get_redis = get_user_redis
+        self._resolve = get_user_id_from_token
+        self._issue = issue_access_token
+
+    def _r(self) -> redis.Redis:
+        return self._get_redis(self._app)
+
+    def get_user(self, user_id: str) -> Optional[Dict[str, Any]]:
+        raw = self._r().get(f"user:{user_id}")
+        return json.loads(raw) if raw else None
+
+    def save_user(self, user: Dict[str, Any]) -> None:
+        r = self._r()
+        r.set(f"user:{user['id']}", json.dumps(user).encode("utf-8"))
+        try:
+            from .user_apis import _hs_dual_save_user as _hs_save_user
+            _hs_save_user(user)
+        except Exception as _e:  # noqa: BLE001
+            import logging as _logging
+            _logging.getLogger("flops.user.dualwrite").warning(
+                "srp save_user dual-write failed uid=%s: %s", user.get("id"), _e,
+            )
+
+    def put_challenge(self, session_id: str, data: Dict[str, Any], ttl_sec: int) -> None:
+        self._r().set(_challenge_key(session_id), json.dumps(data).encode("utf-8"), ex=ttl_sec)
+
+    def take_challenge(self, session_id: str) -> Optional[Dict[str, Any]]:
+        r = self._r()
+        ck = _challenge_key(session_id)
+        raw = r.get(ck)
+        if not raw:
+            return None
+        r.delete(ck)
+        return json.loads(raw)
+
+    def issue_access_token(self, user_id: str, device_name: str) -> str:
+        return self._issue(self._r(), user_id, device_name)
+
+    def resolve_user_id(self, token: str) -> Optional[str]:
+        return self._resolve(token, self._r())
 
 
 def set_srp_credentials(
@@ -98,16 +179,15 @@ def set_srp_credentials(
     if not raw:
         raise HTTPException(status_code=404, detail="User not found")
     user = json.loads(raw)
-    user["srp_salt"] = salt_hex
-    user["srp_verifier"] = verifier_hex
-    user["password_envelope"] = envelope_b64
-    if k_user_blob:
-        user["k_user_blob"] = k_user_blob
-    if k_user_envelope:
-        user["k_user_envelope"] = k_user_envelope
-    if k_user_recovery_blob:
-        user["k_user_recovery_blob"] = k_user_recovery_blob
-    user.pop("password", None)
+    _apply_srp_credentials(
+        user,
+        salt_hex,
+        verifier_hex,
+        envelope_b64,
+        k_user_blob=k_user_blob,
+        k_user_envelope=k_user_envelope,
+        k_user_recovery_blob=k_user_recovery_blob,
+    )
     r_user.set(key, json.dumps(user).encode("utf-8"))
     # SQLite dual-write (best-effort). 复用 user_apis 里已有的 helper
     # 避免重复造轮子。两个文件互相 import 不会循环：user_apis 仅 import
@@ -126,24 +206,39 @@ def set_srp_credentials(
 def register_srp_apis(
     app: FastAPI,
     *,
-    get_user_redis: Callable[[FastAPI], redis.Redis],
-    get_user_id_from_token: Callable[[str, redis.Redis], Optional[str]],
-    issue_access_token: Callable[[redis.Redis, str, str], str],
+    store: "Optional[SessionStore]" = None,
+    get_user_redis: Optional[Callable[[FastAPI], redis.Redis]] = None,
+    get_user_id_from_token: Optional[Callable[[str, redis.Redis], Optional[str]]] = None,
+    issue_access_token: Optional[Callable[[redis.Redis, str, str], str]] = None,
     pubkey_path_resolver: Optional[Callable[[], Path]] = None,
     set_sso_cookie: Optional[Callable[[Response, str], None]] = None,
 ) -> None:
     """挂上 SRP 路由。
 
-    参数:
-      get_user_redis(app) -> Redis
-      get_user_id_from_token(token, r) -> user_id|None
-      issue_access_token(r, user_id, device_name) -> access_token
-        登录成功后用于发 token；复用 user_apis 的设备名复用 / TTL 策略。
+    存储访问经 ``store`` (SessionStore) 抽象。两种注入方式：
+
+    1) 新方式（推荐）：传 ``store=`` 一个 SessionStore 实现（如主仓库的
+       RedisSessionStore）。此时后面三个 legacy callable 可不传。
+    2) 旧方式（deprecated，向后兼容）：传下面三个 callable，内部自动包一层
+       ``_LegacyCallableStore``，行为与引入 seam 之前完全一致：
+         get_user_redis(app) -> Redis
+         get_user_id_from_token(token, r) -> user_id|None
+         issue_access_token(r, user_id, device_name) -> access_token
+
+    其余参数：
       pubkey_path_resolver: 仅用于覆盖 /api/srp/pubkey 暴露的密钥文件路径（测试用）。
-      set_sso_cookie(response, token): 可选；成功登录后写入跨域 SSO Cookie，
-        以便 .xenotech.studio 下各子域共享登录态。不传则不写 Cookie（仅返回
-        access_token 给客户端）。
+      set_sso_cookie(response, token): 可选；成功登录后写入跨域 SSO Cookie。
     """
+
+    if store is None:
+        if not (get_user_redis and get_user_id_from_token and issue_access_token):
+            raise ValueError(
+                "register_srp_apis requires either store= or the legacy "
+                "get_user_redis / get_user_id_from_token / issue_access_token callables"
+            )
+        store = _LegacyCallableStore(
+            app, get_user_redis, get_user_id_from_token, issue_access_token
+        )
 
     def _resolve_pubkey() -> Path:
         if pubkey_path_resolver is not None:
@@ -169,11 +264,9 @@ def register_srp_apis(
         user_id = (payload.get("id") or "").strip()
         if not user_id:
             raise HTTPException(status_code=400, detail="User ID is required")
-        r_user = get_user_redis(app)
-        raw = r_user.get(f"user:{user_id}")
-        if not raw:
+        user = store.get_user(user_id)
+        if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        user = json.loads(raw)
         salt_hex = user.get("srp_salt")
         verifier_hex = user.get("srp_verifier")
         if not salt_hex or not verifier_hex:
@@ -182,18 +275,16 @@ def register_srp_apis(
 
         B_hex, b_hex = srp_helper.server_start_challenge(user_id, verifier_hex)
         session_id = uuid.uuid4().hex
-        r_user.set(
-            _challenge_key(session_id),
-            json.dumps(
-                {
-                    "user_id": user_id,
-                    "salt": salt_hex,
-                    "verifier": verifier_hex,
-                    "b": b_hex,
-                    "created_at": int(time.time()),
-                }
-            ).encode("utf-8"),
-            ex=SRP_CHALLENGE_TTL_SEC,
+        store.put_challenge(
+            session_id,
+            {
+                "user_id": user_id,
+                "salt": salt_hex,
+                "verifier": verifier_hex,
+                "b": b_hex,
+                "created_at": int(time.time()),
+            },
+            SRP_CHALLENGE_TTL_SEC,
         )
         return {"session_id": session_id, "salt": salt_hex, "B": B_hex}
 
@@ -206,14 +297,10 @@ def register_srp_apis(
         if not session_id or not A_hex or not M1:
             raise HTTPException(status_code=400, detail="session_id / A / M1 are required")
 
-        r_user = get_user_redis(app)
-        ck = _challenge_key(session_id)
-        ch_raw = r_user.get(ck)
-        if not ch_raw:
+        # 挑战是一次性的：take = 原子 read+delete，无论后续验证成败都已消费，挡重放
+        challenge = store.take_challenge(session_id)
+        if not challenge:
             raise HTTPException(status_code=403, detail="Challenge expired or unknown")
-        challenge = json.loads(ch_raw)
-        # 挑战是一次性的：无论验证成败都立刻删，挡重放
-        r_user.delete(ck)
 
         ok, M2_hex = srp_helper.server_verify_proof(
             challenge["user_id"],
@@ -227,12 +314,11 @@ def register_srp_apis(
             raise HTTPException(status_code=403, detail="Authentication failed")
 
         user_id = challenge["user_id"]
-        user_raw = r_user.get(f"user:{user_id}")
-        if not user_raw:
+        user = store.get_user(user_id)
+        if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        user = json.loads(user_raw)
 
-        access_token = issue_access_token(r_user, user_id, device_name)
+        access_token = store.issue_access_token(user_id, device_name)
         if set_sso_cookie is not None:
             set_sso_cookie(response, access_token)
         # user 出参不暴露 SRP 内部字段（verifier 是核心秘密；envelope 是 boss 后门）
@@ -263,8 +349,7 @@ def register_srp_apis(
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Authorization header is required")
         bearer = authorization[7:].strip()
-        r_user = get_user_redis(app)
-        user_id = get_user_id_from_token(bearer, r_user)
+        user_id = store.resolve_user_id(bearer)
         if not user_id:
             raise HTTPException(status_code=403, detail="Invalid access token")
 
@@ -294,12 +379,9 @@ def register_srp_apis(
                     detail="old_session_id / old_A / old_M1 are required (or pass super_command)",
                 )
 
-            ck = _challenge_key(old_session_id)
-            ch_raw = r_user.get(ck)
-            if not ch_raw:
+            challenge = store.take_challenge(old_session_id)
+            if not challenge:
                 raise HTTPException(status_code=403, detail="Old-password challenge expired")
-            challenge = json.loads(ch_raw)
-            r_user.delete(ck)
 
             # 防止有人用别人发起的挑战来改自己的密码（或反过来）
             if challenge.get("user_id") != user_id:
@@ -316,9 +398,11 @@ def register_srp_apis(
             if not ok:
                 raise HTTPException(status_code=400, detail="Old password is incorrect")
 
-        set_srp_credentials(
-            r_user,
-            user_id,
+        user = store.get_user(user_id)
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        _apply_srp_credentials(
+            user,
             new_salt,
             new_verifier,
             new_envelope,
@@ -326,6 +410,7 @@ def register_srp_apis(
             k_user_envelope=new_k_user_envelope,
             k_user_recovery_blob=new_k_user_recovery_blob,
         )
+        store.save_user(user)
         return {"message": "Password changed successfully"}
 
     @app.post("/api/srp/upload_k_user")
@@ -348,8 +433,7 @@ def register_srp_apis(
         if not authorization or not authorization.startswith("Bearer "):
             raise HTTPException(status_code=401, detail="Authorization header is required")
         bearer = authorization[7:].strip()
-        r_user = get_user_redis(app)
-        user_id = get_user_id_from_token(bearer, r_user)
+        user_id = store.resolve_user_id(bearer)
         if not user_id:
             raise HTTPException(status_code=403, detail="Invalid access token")
 
@@ -359,11 +443,9 @@ def register_srp_apis(
         k_user_envelope = (payload.get("k_user_envelope") or "").strip() or None
         k_user_recovery_blob = (payload.get("k_user_recovery_blob") or "").strip() or None
 
-        key = f"user:{user_id}"
-        raw = r_user.get(key)
-        if not raw:
+        user = store.get_user(user_id)
+        if not user:
             raise HTTPException(status_code=404, detail="User not found")
-        user = json.loads(raw)
         if user.get("k_user_blob"):
             raise HTTPException(
                 status_code=409,
@@ -374,16 +456,7 @@ def register_srp_apis(
             user["k_user_envelope"] = k_user_envelope
         if k_user_recovery_blob:
             user["k_user_recovery_blob"] = k_user_recovery_blob
-        r_user.set(key, json.dumps(user).encode("utf-8"))
-        # SQLite dual-write (best-effort)
-        try:
-            from .user_apis import _hs_dual_save_user as _hs_save_user
-            _hs_save_user(user)
-        except Exception as _e:  # noqa: BLE001
-            import logging as _logging
-            _logging.getLogger("flops.user.dualwrite").warning(
-                "srp upload_k_user dual-write failed uid=%s: %s", user_id, _e,
-            )
+        store.save_user(user)
         return {"message": "K_user uploaded", "k_user_blob": k_user_blob}
 
 
