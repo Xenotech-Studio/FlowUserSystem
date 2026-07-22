@@ -955,7 +955,7 @@ def register_user_apis(
     # 挂上 SRP 路由（/api/srp/...）。与旧的 /api/login 等明文路径并存，
     # 由前端 SDK 选择走哪条；待迁移完成后再删除明文路径。
     #
-    # 存储访问经 flops_agent.session.SessionStore 抽象；这里注入主仓库的
+    # 存储访问经 user_system.session_store.SessionStore 协议抽象；这里注入主仓库的
     # RedisSessionStore —— 复用现有 Redis + SQLite dual-write 路径（Redis 主、
     # SQLite 副），行为与内联版一致。RedisSessionStore 是主仓库 backend 顶层
     # 模块，经共享 backend/ sys.path 根解析（与其它 backend import 同机制）。
