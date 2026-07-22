@@ -36,8 +36,8 @@ from fastapi import FastAPI, Header, HTTPException, Response
 
 from . import envelope, srp_helper
 
-if TYPE_CHECKING:  # type-only; avoids a runtime import of the kernel package here
-    from flops_agent.session import SessionStore
+if TYPE_CHECKING:  # type-only
+    from .session_store import SessionStore
 
 
 SRP_CHALLENGE_TTL_SEC = 300       # 挑战在 5 分钟内必须完成 proof
