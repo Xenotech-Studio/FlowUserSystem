@@ -12,6 +12,10 @@ User APIs
 from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends, Cookie, Response, Body
 from fastapi.responses import JSONResponse
 from typing import Any, Callable, Optional
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .session_store import SessionStore
 import json
 import time
 import uuid
@@ -408,6 +412,7 @@ def register_user_apis(
     file_to_url: Optional[Callable[..., str]] = None,
     avatar_bucket: Optional[str] = None,
     avatar_folder: str = "AVATARS",
+    session_store_cls: Optional[Callable[..., "SessionStore"]] = None,
 ):
     """
     注册所有用户相关的 API 路由和数据库初始化
@@ -424,6 +429,9 @@ def register_user_apis(
                    `cos_upload.file_to_url`（已废弃，会发 DeprecationWarning）。
       avatar_bucket: 头像 COS bucket；不传时使用模块级 `USER_SYSTEM_COS_BUCKET` 的解析值。
       avatar_folder: 头像 COS 路径前缀（默认 "AVATARS"）。
+      session_store_cls: SRP 鉴权层的存储实现（``session_store.SessionStore`` 协议），以
+                   ``(redis_provider=, issue_token=, resolve_token=, dual_save=)`` 构造。不传时回退到
+                   宿主顶层模块 ``session_store_redis.RedisSessionStore``（旧接法，经 sys.path 根解析）。
     
     返回:
       get_current_user_id: 可用于 Depends 的依赖函数，用于获取当前用户ID
@@ -955,12 +963,12 @@ def register_user_apis(
     # 挂上 SRP 路由（/api/srp/...）。与旧的 /api/login 等明文路径并存，
     # 由前端 SDK 选择走哪条；待迁移完成后再删除明文路径。
     #
-    # 存储访问经 user_system.session_store.SessionStore 协议抽象；这里注入主仓库的
-    # RedisSessionStore —— 复用现有 Redis + SQLite dual-write 路径（Redis 主、
-    # SQLite 副），行为与内联版一致。RedisSessionStore 是主仓库 backend 顶层
-    # 模块，经共享 backend/ sys.path 根解析（与其它 backend import 同机制）。
-    from session_store_redis import RedisSessionStore  # main-repo binding
-    _srp_store = RedisSessionStore(
+    # 存储访问经 user_system.session_store.SessionStore 协议抽象；实现由宿主给
+    # （session_store_cls），复用宿主的 Redis + SQLite dual-write 路径（Redis 主、SQLite 副）。
+    # 没给时回退到旧接法：宿主顶层模块 session_store_redis（经共享 sys.path 根解析）。
+    if session_store_cls is None:
+        from session_store_redis import RedisSessionStore as session_store_cls  # main-repo binding
+    _srp_store = session_store_cls(
         redis_provider=lambda: get_user_redis(app),
         issue_token=issue_or_reuse_access_token,
         resolve_token=get_user_id_from_token,
