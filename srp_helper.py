@@ -13,6 +13,7 @@ argon2 的 salt 复用 SRP 的 salt（同一份 16-byte 随机，per-user）；
 
 from __future__ import annotations
 
+import hmac
 import os
 import secrets
 from typing import Tuple
@@ -99,7 +100,7 @@ def server_start_challenge(user_id: str, verifier_hex: str) -> Tuple[str, str]:
     与 session_id 关联，proof 阶段恢复。
     """
     ctx = _make_context(user_id)
-    session = SRPServerSession(ctx, verifier_hex)
+    session = SRPServerSession(ctx, password_verifier=verifier_hex)
     return _ensure_hex(session.public), _ensure_hex(session.private)
 
 
@@ -116,14 +117,17 @@ def server_verify_proof(
     成功返回 (True, M2_hex)；失败返回 (False, None)。
     """
     ctx = _make_context(user_id)
-    session = SRPServerSession(ctx, verifier_hex, private=b_hex)
+    session = SRPServerSession(ctx, password_verifier=verifier_hex, private=b_hex)
     try:
         session.process(A_hex, salt_hex)
-        # srptools 的 verify_proof 不做 str/bytes 归一：
-        # 库内部 self.key_proof 是 hexlify(bytes) → bytes；前端传过来通常是 str；
-        # 直接 == 永远 False。手动归一到 bytes 再比。
-        m1_bytes = M1.encode("ascii") if isinstance(M1, str) else M1
-        ok = session.verify_proof(m1_bytes)
+        # srptools 1.x 与 2.0 的 verify_proof 对 bytes/str 语义不同；
+        # 统一为 hex 字符串后自行做常量时间比较，兼容两版。
+        # key_proof 是 M1；key_proof_hash 是验证成功后返回的 M2。
+        expected_m1 = session.key_proof
+        if isinstance(expected_m1, bytes):
+            expected_m1 = expected_m1.decode("ascii")
+        received_m1 = M1.decode("ascii") if isinstance(M1, bytes) else M1
+        ok = hmac.compare_digest(received_m1.strip().lower(), expected_m1.strip().lower())
     except Exception:
         return False, None
     if not ok:
