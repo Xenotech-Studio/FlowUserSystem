@@ -9,7 +9,7 @@ User APIs
 - 头像上传
 """
 
-from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends, Cookie, Response, Body
+from fastapi import FastAPI, HTTPException, Header, UploadFile, File, Depends, Cookie, Response, Body, Request
 from fastapi.responses import JSONResponse
 from typing import Any, Callable, Optional
 import json
@@ -124,18 +124,28 @@ self_userinfo_keys_mask = [
 ]
 
 # -------------------- 跨域 SSO Cookie 配置 --------------------
-# 同账号在 .xenotech.studio 各子域（e-store-00 ~ e-store-08）共享登录态。
+# 同账号在请求所属的受支持主域下共享登录态。
 # 与 Authorization: Bearer header 并存，header 优先；浏览器以外的客户端继续走 header。
 SSO_COOKIE_NAME = "estore_access_token"
-SSO_COOKIE_DOMAIN = ".xenotech.studio"
+SSO_COOKIE_DOMAINS = ("xenotech.studio", "eshowroom.cn", "yanghaowen.site")
 SSO_COOKIE_MAX_AGE = 30 * 24 * 60 * 60  # 与 access token TTL 对齐
 
 
-def _set_sso_cookie(response: Response, token: str) -> None:
+def _sso_cookie_domain(request: Request) -> Optional[str]:
+    # Only configured registrable domains can receive a shared cookie.
+    # Unknown hosts (including localhost/IPs) deliberately use host-only cookies.
+    host = request.headers.get("host", "").split(":", 1)[0].lower().rstrip(".")
+    for domain in SSO_COOKIE_DOMAINS:
+        if host == domain or host.endswith("." + domain):
+            return "." + domain
+    return None
+
+
+def _set_sso_cookie(response: Response, token: str, request: Request) -> None:
     response.set_cookie(
         key=SSO_COOKIE_NAME,
         value=token,
-        domain=SSO_COOKIE_DOMAIN,
+        domain=_sso_cookie_domain(request),
         path="/",
         samesite="lax",
         secure=True,
@@ -144,10 +154,10 @@ def _set_sso_cookie(response: Response, token: str) -> None:
     )
 
 
-def _clear_sso_cookie(response: Response) -> None:
+def _clear_sso_cookie(response: Response, request: Request) -> None:
     response.delete_cookie(
         key=SSO_COOKIE_NAME,
-        domain=SSO_COOKIE_DOMAIN,
+        domain=_sso_cookie_domain(request),
         path="/",
     )
 
@@ -622,7 +632,7 @@ def register_user_apis(
         return {"message": "Password changed successfully", "user": user_hidding_password}
 
     @app.post("/api/login")
-    async def login(login_request: dict, response: Response):
+    async def login(login_request: dict, response: Response, request: Request):
         """User login"""
         r_user = app.state.redis_user
         user_id = login_request.get("id")
@@ -653,7 +663,7 @@ def register_user_apis(
 
         device_name = login_request.get("device_name", "Unknown Device")
         existing_token = issue_or_reuse_access_token(r_user, user_id, device_name)
-        _set_sso_cookie(response, existing_token)
+        _set_sso_cookie(response, existing_token, request)
         public_user = {k: v for k, v in user.items() if k not in self_userinfo_keys_mask}
         return {"message": "Login successful", "user": public_user, "access_token": existing_token}
 
@@ -823,6 +833,7 @@ def register_user_apis(
     @app.post("/api/logout")
     async def logout(
         response: Response,
+        request: Request,
         logout_request: Optional[dict] = Body(default=None),
         authorization: str = Header(None),
         estore_access_token: Optional[str] = Cookie(None),
@@ -860,7 +871,7 @@ def register_user_apis(
             _delete_token_meta(r_user, user_id, access_token)
             r_user.delete(f"access_token_lookup:{access_token}")
             _hs_dual_delete_token(access_token)
-            _clear_sso_cookie(response)
+            _clear_sso_cookie(response, request)
             print(f"User {user_id} logged out from device {device_name}.")
             return {"message": "Logged out successfully"}
 
